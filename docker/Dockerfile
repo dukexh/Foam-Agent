@@ -10,6 +10,8 @@ RUN apt-get update \
         python3 \
         python3-pip \
         libboost-all-dev \
+        xvfb \
+        libgl1 \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -39,6 +41,10 @@ RUN conda config --add channels conda-forge && \
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
     conda env create --file environment.yml --yes
 
+# Gmsh is required by the custom and generated mesh workflow.  Keep it in the
+# FoamAgent environment rather than relying on a host-level Python package.
+RUN conda run -n FoamAgent pip install --no-cache-dir gmsh
+
 # Initialize conda for bash (automatic setup)
 RUN conda init bash && \
     echo "conda activate FoamAgent" >> ~/.bashrc
@@ -60,6 +66,8 @@ RUN apt-get update \
         ca-certificates \
         git \
         git-lfs \
+        xvfb \
+        libgl1 \
     && git lfs install \
     && rm -rf /var/lib/apt/lists/*
 
@@ -72,6 +80,8 @@ ENV FoamAgent_PATH="/home/openfoam/Foam-Agent"
 COPY --from=builder --chown=root:root $CONDA_DIR $CONDA_DIR
 COPY --from=builder --chown=root:root $FoamAgent_PATH $FoamAgent_PATH
 COPY --from=builder --chown=root:root /root/.bashrc /root/.bashrc
+
+ENV FOAMAGENT_IMAGE_OPENFOAM_TARGET=foundation-v10
 
 # Ensure conda is properly initialized in .bashrc for interactive shells
 RUN echo '' >> /root/.bashrc && \

@@ -3,6 +3,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from openfoam_target import normalise_openfoam_target
+
 
 @dataclass
 class Config:
@@ -13,6 +15,7 @@ class Config:
     database_path: str = Path(__file__).resolve().parent.parent / "database"
     run_directory: str = Path(__file__).resolve().parent.parent / "runs"
     case_dir: str = ""
+    overwrite_case_dir: bool = False
     max_time_limit: int = 3600  # Max time limit after which the openfoam run will be terminated, in seconds
     recursion_limit: int = 100  # LangGraph recursion limit
     # Input writer generation mode:
@@ -32,13 +35,20 @@ class Config:
     model_provider: str = "openai-codex"  # [openai, openai-codex, ollama, bedrock, anthropic, deepseek]
     # model_version examples:
     # - OpenAI: "gpt-5-mini"
-    # - OpenAI Codex subscription: "gpt-5.3-codex" (or whichever Codex model you have access to)
+    # - OpenAI Codex subscription: "gpt-5.6-terra" (or whichever Codex model you have access to)
     # - Ollama: "qwen2.5:32b-instruct"
     # - Bedrock: application inference profile ARN
     # - Anthropic: claude-3-5-sonnet-latest
-    model_version: str = "gpt-5.3-codex"
+    model_version: str = "gpt-5.6-terra"
     temperature: float = 1
     openfoam_fork: str = "foundation"  # Default to Foundation v10
+    # An explicit target is additive.  Leaving it empty keeps the existing
+    # Foundation/generic-ESI routing exactly as it was before v2006 support.
+    openfoam_target: str = ""
+    esi_v2006_database_path: str = ""
+    # Optional, trusted cluster-side bashrc used by native target job scripts.
+    # Local runs continue to use WM_PROJECT_DIR/etc/bashrc.
+    hpc_openfoam_bashrc: str = ""
     
     # Embedding Configuration
     embedding_provider: str = "huggingface"  # [openai, huggingface, ollama]
@@ -119,3 +129,42 @@ class Config:
                 print(f"<config>openfoam_fork={self.openfoam_fork} (default; invalid env:{fork_key}={fork_env!r})</config>")
         else:
             print(f"<config>openfoam_fork={self.openfoam_fork} (default)</config>")
+
+        # Explicit version target.  This is intentionally separate from
+        # FOAMAGENT_OPENFOAM_FORK so old ``esi`` configurations retain their
+        # post-generation translation behaviour.
+        target_key = "FOAMAGENT_OPENFOAM_TARGET"
+        target_env = _env_nonempty(target_key)
+        if target_env is not None:
+            # Unlike the historical fork switch, this is an explicit native
+            # platform contract.  Silently falling back to Foundation after a
+            # spelling error could run a v2006 case against the wrong solver.
+            self.openfoam_target = normalise_openfoam_target(target_env)
+            print(
+                f"<config>openfoam_target={self.openfoam_target} "
+                f"(env:{target_key})</config>"
+            )
+        else:
+            # Validate programmatic construction too, while preserving the
+            # historical empty value as the legacy path.
+            self.openfoam_target = normalise_openfoam_target(self.openfoam_target)
+            label = self.openfoam_target or "legacy"
+            print(f"<config>openfoam_target={label} (default)</config>")
+
+        esi_database_key = "FOAMAGENT_ESI_V2006_DATABASE_PATH"
+        esi_database_env = _env_nonempty(esi_database_key)
+        if esi_database_env is not None:
+            self.esi_v2006_database_path = esi_database_env
+            print(
+                f"<config>esi_v2006_database_path={self.esi_v2006_database_path} "
+                f"(env:{esi_database_key})</config>"
+            )
+
+        hpc_bashrc_key = "FOAMAGENT_HPC_OPENFOAM_BASHRC"
+        hpc_bashrc_env = _env_nonempty(hpc_bashrc_key)
+        if hpc_bashrc_env is not None:
+            self.hpc_openfoam_bashrc = hpc_bashrc_env
+            print(
+                f"<config>hpc_openfoam_bashrc={self.hpc_openfoam_bashrc} "
+                f"(env:{hpc_bashrc_key})</config>"
+            )
