@@ -65,6 +65,14 @@ def _generation_contract(openfoam_fork: str) -> str:
             "For blockMesh boundary dictionaries, every symmetryPlane patch must contain only coplanar faces. For a pair of parallel but spatially separate symmetry faces, either use the generic symmetry patch type or create one symmetryPlane patch per plane.",
             "When a Foundation momentumTransport or momentumTransport.<phase> dictionary is generated, it must declare simulationType (for example, laminar when the prompt requests laminar flow) before its model coefficients.",
         ]
+    elif fork == "esi-v2006":
+        constraints = [
+            "The target runtime is ESI/OpenCFD OpenFOAM v2006 from openfoam.com.",
+            "Generate a native ESI v2006 case directly from the supplied ESI v2006 tutorial references.",
+            "Use only ESI v2006 solver, file, dictionary, function-object, and boundary-condition conventions.",
+            "Do not use Foundation OpenFOAM v10 conventions and do not rely on any post-generation translator.",
+            "Keep all generated files internally consistent with the ESI v2006 solver selected by the planner.",
+        ]
     elif fork == "esi":
         constraints = [
             "The configured target runtime is ESI/OpenCFD OpenFOAM from openfoam.com.",

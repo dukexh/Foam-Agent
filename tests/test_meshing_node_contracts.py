@@ -57,6 +57,52 @@ def test_gmsh_route_preserves_case_context_and_injected_llm(
     }
 
 
+def test_gmsh_route_forwards_only_the_explicit_v2006_runtime_target(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The native target reaches meshing without changing legacy calls."""
+    meshing_node = importlib.import_module("nodes.meshing_node")
+    captured: dict[str, object] = {}
+
+    def fake_handle_gmsh_mesh(
+        user_requirement: str,
+        case_dir: str,
+        max_loop: int,
+        *,
+        llm_service: object,
+        openfoam_target: str,
+    ) -> dict[str, object]:
+        captured.update(
+            user_requirement=user_requirement,
+            case_dir=case_dir,
+            max_loop=max_loop,
+            llm_service=llm_service,
+            openfoam_target=openfoam_target,
+        )
+        return {"mesh_info": {}, "error_logs": []}
+
+    monkeypatch.setattr(meshing_node, "service_handle_gmsh_mesh", fake_handle_gmsh_mesh)
+    injected_llm = object()
+    meshing_node.meshing_node(
+        {
+            "config": SimpleNamespace(max_loop=4, openfoam_target="esi-v2006"),
+            "user_requirement": "Create a Gmsh channel mesh.",
+            "case_dir": str(tmp_path / "planned-case"),
+            "llm_service": injected_llm,
+            "mesh_type": "gmsh_mesh",
+        }
+    )
+
+    assert captured == {
+        "user_requirement": "Create a Gmsh channel mesh.",
+        "case_dir": str(tmp_path / "planned-case"),
+        "max_loop": 4,
+        "llm_service": injected_llm,
+        "openfoam_target": "esi-v2006",
+    }
+
+
 def test_gmsh_service_returns_the_same_complete_contract_after_refactoring(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

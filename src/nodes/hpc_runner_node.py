@@ -12,6 +12,7 @@ from services.run_hpc import (
     create_slurm_script,
 )
 from logger import log_review
+from openfoam_target import runtime_target_for_config
 
 
 def hpc_runner_node(state):
@@ -58,6 +59,8 @@ def hpc_runner_node(state):
                 case_dir,
                 cluster_info,
                 llm_service=llm_service,
+                openfoam_target=runtime_target_for_config(config),
+                openfoam_bashrc=getattr(config, "hpc_openfoam_bashrc", ""),
             )
         else:
             print(f"Regenerating SLURM script based on previous error...")
@@ -73,6 +76,8 @@ def hpc_runner_node(state):
                 last_error_msg,
                 prev,
                 llm_service=llm_service,
+                openfoam_target=runtime_target_for_config(config),
+                openfoam_bashrc=getattr(config, "hpc_openfoam_bashrc", ""),
             )
         
         print(f"SLURM script created at: {script_path}")

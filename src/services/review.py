@@ -24,6 +24,18 @@ REVIEWER_SYSTEM_PROMPT = (
 )
 
 
+def _reviewer_system_prompt(openfoam_target: str) -> str:
+    """Add a native-version constraint without changing legacy review prompts."""
+    if openfoam_target != "esi-v2006":
+        return REVIEWER_SYSTEM_PROMPT
+    return (
+        REVIEWER_SYSTEM_PROMPT
+        + " The target is native ESI/OpenCFD OpenFOAM v2006. Diagnose and repair "
+        "only with ESI v2006 conventions from the supplied ESI tutorial reference; "
+        "do not propose Foundation v10 syntax or post-generation translation."
+    )
+
+
 def review_error_logs(
     tutorial_reference: str,
     foamfiles: Any,
@@ -32,6 +44,7 @@ def review_error_logs(
     similar_case_advice: Optional[Any] = None,
     history_text: Optional[List[str]] = None,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
 ) -> Tuple[str, List[str]]:
     """Stateless reviewer: returns (review_analysis, updated_history)."""
     advice_text = ""
@@ -67,7 +80,10 @@ def review_error_logs(
         )
 
     llm_client = llm_service if llm_service is not None else global_llm_service
-    review_response = llm_client.invoke(reviewer_user_prompt, REVIEWER_SYSTEM_PROMPT)
+    review_response = llm_client.invoke(
+        reviewer_user_prompt,
+        _reviewer_system_prompt(openfoam_target),
+    )
     review_content = review_response
 
     updated_history = list(history_text) if history_text else []
@@ -87,6 +103,7 @@ def generate_rewrite_plan(
     review_analysis: str,
     user_requirement: str,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
 ) -> dict:
     """Generate a minimal, explicit rewrite plan for downstream rewrite step."""
     planner_system_prompt = (
@@ -101,6 +118,11 @@ def generate_rewrite_plan(
         "4) Do not include parentheses, backticks, or quote characters inside changes text. "
         "5) Do not include run steps; only file edits."
     )
+    if openfoam_target == "esi-v2006":
+        planner_system_prompt += (
+            " The target is native ESI/OpenCFD OpenFOAM v2006; preserve its "
+            "dictionary conventions and do not request Foundation v10 translations."
+        )
 
     planner_user_prompt = (
         f"<foamfiles>{str(foamfiles)}</foamfiles>\n"

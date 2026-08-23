@@ -1,4 +1,5 @@
 from services.mesh import copy_custom_mesh, prepare_standard_mesh, handle_gmsh_mesh as service_handle_gmsh_mesh
+from openfoam_target import runtime_target_for_config
 
 def meshing_node(state):
     """
@@ -17,6 +18,8 @@ def meshing_node(state):
     user_requirement = state["user_requirement"]
     case_dir = state["case_dir"]
     llm_service = state.get("llm_service")
+    runtime_target = runtime_target_for_config(state["config"])
+    target_kwargs = {"openfoam_target": runtime_target} if runtime_target else {}
     
     # Get mesh type from state (determined by router)
     mesh_type = state.get("mesh_type", "standard_mesh")
@@ -30,6 +33,7 @@ def meshing_node(state):
             user_requirement,
             case_dir,
             llm_service=llm_service,
+            **target_kwargs,
         )
     elif mesh_type == "gmsh_mesh":
         print("<mesh_routing>GMSH mesh requested.</mesh_routing>")
@@ -38,6 +42,7 @@ def meshing_node(state):
             case_dir,
             state["config"].max_loop,
             llm_service=llm_service,
+            **target_kwargs,
         )
     else:
         print("<mesh_routing>Standard mesh generation.</mesh_routing>")

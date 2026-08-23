@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 from pydantic import BaseModel, Field
-from utils import save_file
+from utils import run_openfoam_utility, save_file
 from . import global_llm_service
 
 
@@ -51,6 +51,7 @@ def copy_custom_mesh(
     case_dir: str,
     *,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
 ) -> Dict[str, Any]:
     """
     Copy and process a custom mesh file for OpenFOAM simulation.
@@ -112,27 +113,31 @@ def copy_custom_mesh(
         "IMPORTANT: Return ONLY the complete controlDict file content without any additional text."
     )
     llm_client = llm_service if llm_service is not None else global_llm_service
+    target_constraint = (
+        " The selected OpenFOAM runtime is native ESI/OpenCFD v2006. "
+        "Use only ESI v2006 controlDict conventions."
+        if openfoam_target == "esi-v2006"
+        else ""
+    )
     controldict_content = llm_client.invoke(controldict_prompt, (
         "You are an expert in OpenFOAM simulation setup. "
         "Create a minimal controlDict for gmshToFoam."
+        + target_constraint
     )).strip()
     if controldict_content:
         save_file(os.path.join(system_dir, "controlDict"), controldict_content)
 
     # Convert mesh
     try:
-        subprocess.run(
+        run_openfoam_utility(
             ["gmshToFoam", "geometry.msh"],
-            cwd=case_dir,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            working_dir=case_dir,
             timeout=_MESH_COMMAND_TIMEOUT_SECONDS,
+            openfoam_target=openfoam_target,
         )
     except subprocess.CalledProcessError as e:
         return _mesh_failure([f"gmshToFoam failed: {e.stderr or e.stdout or e}"])
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         return _mesh_failure([f"Could not start gmshToFoam: {exc}"])
     except subprocess.TimeoutExpired:
         return _mesh_failure([
@@ -439,17 +444,15 @@ def run_checkmesh_and_correct(
     current_loop: int,
     *,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
 ) -> Tuple[bool, bool, str]:
     """Run checkMesh and optionally generate corrected code. Returns (success, should_continue, corrected_code)."""
     try:
-        result = subprocess.run(
+        result = run_openfoam_utility(
             ["checkMesh"],
-            cwd=case_dir,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            working_dir=case_dir,
             timeout=_MESH_COMMAND_TIMEOUT_SECONDS,
+            openfoam_target=openfoam_target,
         )
         checkmesh_output = result.stdout
         if "Failed" in checkmesh_output and "mesh checks" in checkmesh_output:
@@ -476,7 +479,7 @@ def run_checkmesh_and_correct(
         if current_loop < max_loop:
             return False, True, None
         return False, False, ""
-    except OSError:
+    except (OSError, RuntimeError):
         return False, False, ""
     except subprocess.TimeoutExpired:
         return False, False, ""
@@ -486,6 +489,7 @@ def _next_gmsh_code(
     user_requirement: str,
     llm_client: Any,
     corrected_python_code: Optional[str],
+    openfoam_target: str = "",
 ) -> tuple[str, str]:
     """Use a correction when available, otherwise request a fresh Gmsh script."""
     if corrected_python_code is not None:
@@ -495,6 +499,12 @@ def _next_gmsh_code(
         "Please create Python code using the GMSH library to generate a mesh based on the user requirements. "
         "Use boundary names specified in user requirements (for example inlet, outlet, wall, or cylinder). "
         "Return ONLY the complete Python code without any additional text."
+        + (
+            " The resulting mesh will be converted by native ESI/OpenCFD v2006 "
+            "gmshToFoam; use v2006-compatible OpenFOAM boundary expectations."
+            if openfoam_target == "esi-v2006"
+            else ""
+        )
     )
     response = llm_client.invoke(
         python_prompt,
@@ -529,6 +539,7 @@ def _convert_gmsh_mesh(
     case_dir: str,
     user_requirement: str,
     llm_client: Any,
+    openfoam_target: str = "",
 ) -> str:
     """Generate conversion support files and return the resulting boundary path."""
     constant_dir = os.path.join(case_dir, "constant")
@@ -539,17 +550,19 @@ def _convert_gmsh_mesh(
         f"<user_requirements>{user_requirement}</user_requirements>\n"
         "Create a minimal controlDict needed for gmshToFoam. Return ONLY the complete controlDict content."
     )
-    control_dict = llm_client.invoke(control_prompt, CONTROLDICT_SYSTEM_PROMPT).strip()
+    target_prompt = CONTROLDICT_SYSTEM_PROMPT + (
+        " The selected runtime is native ESI/OpenCFD v2006; use only its controlDict conventions."
+        if openfoam_target == "esi-v2006"
+        else ""
+    )
+    control_dict = llm_client.invoke(control_prompt, target_prompt).strip()
     if control_dict:
         save_file(os.path.join(system_dir, "controlDict"), control_dict)
-    subprocess.run(
+    run_openfoam_utility(
         ["gmshToFoam", "geometry.msh"],
-        cwd=case_dir,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+        working_dir=case_dir,
         timeout=_MESH_COMMAND_TIMEOUT_SECONDS,
+        openfoam_target=openfoam_target,
     )
     boundary_file = os.path.join(constant_dir, "polyMesh", "boundary")
     if not os.path.isfile(boundary_file):
@@ -639,6 +652,7 @@ def handle_gmsh_mesh(
     max_loop: int = 3,
     *,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
 ) -> Dict[str, Any]:
     """
     Generate GMSH mesh for OpenFOAM simulation using Python API.
@@ -696,10 +710,12 @@ def handle_gmsh_mesh(
     for attempt in range(1, attempts + 1):
         try:
             _clear_gmsh_attempt_outputs(case_dir)
+            next_code_kwargs = {"openfoam_target": openfoam_target} if openfoam_target else {}
             python_code, geometry_type = _next_gmsh_code(
                 user_requirement,
                 llm_client,
                 corrected_python_code,
+                **next_code_kwargs,
             )
             corrected_python_code = None
             if not python_code:
@@ -715,7 +731,13 @@ def handle_gmsh_mesh(
                     llm_service=llm_client,
                 )
                 continue
-            boundary_file = _convert_gmsh_mesh(case_dir, user_requirement, llm_client)
+            convert_kwargs = {"openfoam_target": openfoam_target} if openfoam_target else {}
+            boundary_file = _convert_gmsh_mesh(
+                case_dir,
+                user_requirement,
+                llm_client,
+                **convert_kwargs,
+            )
             has_mismatch, corrected_python_code = _correct_boundary_mismatch(
                 boundary_file,
                 expected_boundaries,
@@ -734,6 +756,7 @@ def handle_gmsh_mesh(
                 attempts,
                 attempt,
                 llm_service=llm_client,
+                openfoam_target=openfoam_target,
             )
             if not mesh_ok:
                 error_logs.append("checkMesh did not pass for the generated mesh.")
@@ -750,6 +773,7 @@ def handle_gmsh_mesh(
                 attempts,
                 attempt,
                 llm_service=llm_client,
+                openfoam_target=openfoam_target,
             )
             if not mesh_ok:
                 error_logs.append("checkMesh did not pass after the boundary update.")
@@ -771,7 +795,7 @@ def handle_gmsh_mesh(
             error_logs.append(
                 f"Mesh command timed out after {_MESH_COMMAND_TIMEOUT_SECONDS}s."
             )
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             error_logs.append(f"Mesh setup failed: {exc}")
 
     return _mesh_failure(error_logs or [f"Mesh generation failed after {attempts} attempts."])

@@ -80,6 +80,34 @@ def validate_momentum_transport_dictionaries(case_dir: str) -> List[str]:
     return issues
 
 
+def validate_esi_v2006_turbulence_dictionaries(case_dir: str) -> List[str]:
+    """Check the native ESI v2006 turbulence selector when it is present.
+
+    ESI v2006 uses ``turbulenceProperties`` instead of Foundation's
+    ``momentumTransport`` dictionary.  This deliberately mirrors the light
+    weight Foundation check: OpenFOAM remains the full parser, while the agent
+    catches the common missing selector before execution.
+    """
+    constant_dir = Path(case_dir) / "constant"
+    try:
+        dictionaries = sorted(
+            path for path in constant_dir.glob("turbulenceProperties*")
+            if path.is_file()
+        )
+    except OSError:
+        return []
+
+    issues: List[str] = []
+    for dictionary in dictionaries:
+        content = _strip_foam_comments(_read_text(dictionary))
+        if not re.search(r"\bsimulationType\s+[^\s;]+\s*;", content):
+            issues.append(
+                f"constant/{dictionary.name} is missing the required ESI v2006 "
+                "simulationType entry"
+            )
+    return issues
+
+
 def _balanced_foam_block(text: str, keyword: str, opener: str, closer: str) -> str:
     """Return a balanced OpenFOAM list/dictionary body following *keyword*.
 
@@ -218,6 +246,8 @@ def validate_blockmesh_symmetry_planes(case_dir: str) -> List[str]:
 def validate_openfoam_case_preflight(
     case_dir: str,
     allrun_script: Optional[str] = None,
+    *,
+    openfoam_target: str = "",
 ) -> List[Dict[str, str]]:
     """Validate generic execution contracts before launching OpenFOAM."""
     allrun_path = Path(case_dir) / "Allrun"
@@ -231,10 +261,19 @@ def validate_openfoam_case_preflight(
             _validation_error("system/blockMeshDict", message)
             for message in validate_blockmesh_symmetry_planes(case_dir)
         )
-    errors.extend(
-        _validation_error("constant/momentumTransport", message)
-        for message in validate_momentum_transport_dictionaries(case_dir)
-    )
+    # ``momentumTransport`` and its mandatory ``simulationType`` are a
+    # Foundation-v10 contract.  ESI v2006 owns different native turbulence
+    # dictionaries, so applying this check there would reject valid cases.
+    if openfoam_target == "esi-v2006":
+        errors.extend(
+            _validation_error("constant/turbulenceProperties", message)
+            for message in validate_esi_v2006_turbulence_dictionaries(case_dir)
+        )
+    else:
+        errors.extend(
+            _validation_error("constant/momentumTransport", message)
+            for message in validate_momentum_transport_dictionaries(case_dir)
+        )
     check_mesh_positions = allrun_command_positions(script_without_comments, "checkMesh")
     application = _control_dict_application(case_dir)
     application_positions = allrun_application_positions(script_without_comments, application)
@@ -419,7 +458,9 @@ def _cleanup_run_artifacts(case_dir: str) -> None:
 def run_allrun_and_collect_errors(
     case_dir: str,
     timeout: int = 3600,
-    max_retries: int = 1
+    max_retries: int = 1,
+    *,
+    openfoam_target: str = "",
 ) -> List[Any]:
     """
     Execute the Allrun script and collect any error logs from the simulation.
@@ -458,7 +499,11 @@ def run_allrun_and_collect_errors(
         return [f"Allrun script not found at {allrun_file_path}"]
 
     allrun_script = _read_text(Path(allrun_file_path))
-    preflight_errors = validate_openfoam_case_preflight(case_dir, allrun_script)
+    preflight_errors = validate_openfoam_case_preflight(
+        case_dir,
+        allrun_script,
+        openfoam_target=openfoam_target,
+    )
     if preflight_errors:
         return preflight_errors
     
@@ -473,12 +518,18 @@ def run_allrun_and_collect_errors(
     # Run with retries
     for attempt in range(1, max_retries + 1):
         print(f"Running Allrun (attempt {attempt}/{max_retries})")
+        command_kwargs = (
+            {"openfoam_target": openfoam_target}
+            if openfoam_target
+            else {}
+        )
         command_result = run_command(
             allrun_file_path,
             out_file,
             err_file,
             case_dir,
             timeout,
+            **command_kwargs,
         )
 
         # Inspect
@@ -516,7 +567,9 @@ def run_simulation_local(
     case_id: str,
     case_dir: str,
     timeout: int = 3600,
-    max_retries: int = 1
+    max_retries: int = 1,
+    *,
+    openfoam_target: str = "",
 ) -> RunOut:
     """
     Run OpenFOAM simulation locally and return execution status.
@@ -548,6 +601,11 @@ def run_simulation_local(
         ... )
         >>> print(f"Simulation status: {result.status}")
     """
-    errors = run_allrun_and_collect_errors(case_dir, timeout, max_retries)
+    errors = run_allrun_and_collect_errors(
+        case_dir,
+        timeout,
+        max_retries,
+        openfoam_target=openfoam_target,
+    )
     status = "completed" if len(errors) == 0 else "failed"
     return RunOut(job_id=None, status=status)

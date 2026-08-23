@@ -1,7 +1,7 @@
 """Restricted Allrun parser and renderer for imported OpenFOAM cases.
 
 Unlike generated cases, an imported ``Allrun`` is treated as untrusted input.
-This module turns a small Foundation-v10 subset into a data-only execution
+This module turns a small native-platform subset into a data-only execution
 plan, then renders the controlled equivalent used by the runner.
 """
 
@@ -19,12 +19,13 @@ from .allrun_commands import (
 )
 from .case_import_models import CaseImportError, ExecutionStep
 from .openfoam_commands import MESH_MUTATING_COMMANDS
+from openfoam_target import FOUNDATION_V10, controlled_allrun_runtime_guard
 
 
 _SHELL_META_RE = re.compile(r"[;&|`<>]")
 _SAFE_COMMAND_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 _SAFE_ARGUMENT_RE = re.compile(r"^[A-Za-z0-9_./:=+@%$,-]+$")
-_ALLOWED_UTILITY_COMMANDS = frozenset(
+_COMMON_ALLOWED_UTILITY_COMMANDS = frozenset(
     {
         "blockMesh",
         "checkMesh",
@@ -41,6 +42,23 @@ _ALLOWED_UTILITY_COMMANDS = frozenset(
         "topoSet",
     }
 )
+
+# Keep the current Foundation import surface exactly intact.  v2006 starts
+# with the same explicitly audited stock utilities, but is represented as a
+# separate profile so platform-specific utilities can be added only after a
+# native v2006 review instead of accidentally inheriting Foundation policy.
+_ALLOWED_UTILITY_COMMANDS_BY_PLATFORM = {
+    FOUNDATION_V10: _COMMON_ALLOWED_UTILITY_COMMANDS,
+    "foundation-v10-compatible": _COMMON_ALLOWED_UTILITY_COMMANDS,
+    "esi-v2006": _COMMON_ALLOWED_UTILITY_COMMANDS,
+}
+
+
+def _allowed_utility_commands(platform: str) -> frozenset[str]:
+    return _ALLOWED_UTILITY_COMMANDS_BY_PLATFORM.get(
+        platform,
+        _COMMON_ALLOWED_UTILITY_COMMANDS,
+    )
 
 
 def _safe_tokens(command: str, args: Iterable[str]) -> None:
@@ -78,7 +96,7 @@ def _shell_split(line: str) -> list[str]:
 
 
 def _is_supported_setup_line(line: str) -> bool:
-    """Allow only Foundation v10's normal RunFunctions setup boilerplate."""
+    """Allow only the standard OpenFOAM RunFunctions setup boilerplate."""
     normalised = re.sub(r"\s+", " ", line).strip()
     return normalised in {
         ". $WM_PROJECT_DIR/bin/tools/RunFunctions",
@@ -92,7 +110,11 @@ def _is_supported_setup_line(line: str) -> bool:
     }
 
 
-def _parse_execution_line(line: str, application: str) -> ExecutionStep:
+def _parse_execution_line(
+    line: str,
+    application: str,
+    platform: str,
+) -> ExecutionStep:
     """Parse one non-setup Allrun line into an allow-listed execution step."""
     tokens = _shell_split(line)
     if not tokens:
@@ -106,10 +128,13 @@ def _parse_execution_line(line: str, application: str) -> ExecutionStep:
     else:
         command = _resolve_application(launcher, application)
     _safe_tokens(command, tokens)
-    if command != application and command not in _ALLOWED_UTILITY_COMMANDS:
+    if command != application and command not in _allowed_utility_commands(platform):
+        platform_label = (
+            "ESI/OpenCFD v2006" if platform == "esi-v2006" else "Foundation v10"
+        )
         raise CaseImportError(
             f"Unsupported command in user Allrun: {command}. "
-            "Only Foundation v10 utilities and the controlDict application are allowed."
+            f"Only {platform_label} utilities and the controlDict application are allowed."
         )
     if parallel and command != application:
         raise CaseImportError(
@@ -118,7 +143,11 @@ def _parse_execution_line(line: str, application: str) -> ExecutionStep:
     return ExecutionStep(command, tuple(tokens), parallel)
 
 
-def _parse_allrun_line(line: str, application: str) -> ExecutionStep | None:
+def _parse_allrun_line(
+    line: str,
+    application: str,
+    platform: str,
+) -> ExecutionStep | None:
     """Ignore known setup lines and parse an allowed OpenFOAM command."""
     if not line or line.startswith("#!"):
         return None
@@ -130,13 +159,18 @@ def _parse_allrun_line(line: str, application: str) -> ExecutionStep | None:
         if not _is_supported_setup_line(line):
             raise CaseImportError(
                 "Unsupported shell setup in Allrun. Only the standard "
-                "Foundation v10 RunFunctions source and case-directory cd are allowed."
+                "OpenFOAM RunFunctions source and case-directory cd are allowed."
             )
         return None
-    return _parse_execution_line(line, application)
+    return _parse_execution_line(line, application, platform)
 
 
-def parse_allrun(allrun_content: str, application: str) -> list[ExecutionStep]:
+def parse_allrun(
+    allrun_content: str,
+    application: str,
+    *,
+    platform: str = FOUNDATION_V10,
+) -> list[ExecutionStep]:
     """Parse the supported, non-Turing-complete subset of an imported Allrun."""
     try:
         lines = normalise_shell_lines(allrun_content)
@@ -146,7 +180,13 @@ def parse_allrun(allrun_content: str, application: str) -> list[ExecutionStep]:
     steps = [
         step
         for raw_line in lines
-        if (step := _parse_allrun_line(strip_shell_comment(raw_line), application))
+        if (
+            step := _parse_allrun_line(
+                strip_shell_comment(raw_line),
+                application,
+                platform,
+            )
+        )
         is not None
     ]
     if not steps:
@@ -236,16 +276,17 @@ def ensure_mesh_check(
     return repaired
 
 
-def render_controlled_allrun(steps: list[ExecutionStep]) -> str:
+def render_controlled_allrun(
+    steps: list[ExecutionStep],
+    *,
+    platform: str = FOUNDATION_V10,
+) -> str:
     """Render a fail-closed equivalent of the validated execution plan."""
     lines = [
         "#!/bin/sh",
         'cd "${0%/*}/.." || exit 1',
         '. "$WM_PROJECT_DIR/bin/tools/RunFunctions"',
-        'if [ "${WM_PROJECT_VERSION:-}" != "10" ]; then',
-        '    echo "Foam-Agent case-import requires Foundation OpenFOAM v10 (WM_PROJECT_VERSION=10)." >&2',
-        "    exit 64",
-        "fi",
+        *controlled_allrun_runtime_guard(platform),
         "foamagent_require_stock_command() {",
         '    foamagent_command_path=$(command -v "$1") || {',
         '        echo "Required OpenFOAM command is unavailable: $1" >&2',
@@ -253,7 +294,7 @@ def render_controlled_allrun(steps: list[ExecutionStep]) -> str:
         "    }",
         '    case "$foamagent_command_path" in',
         '        "$FOAM_APPBIN"/*) return 0 ;;',
-        '        *) echo "Custom or non-Foundation command is not allowed: $1 ($foamagent_command_path)" >&2; return 64 ;;',
+        '        *) echo "Custom or non-stock OpenFOAM command is not allowed: $1 ($foamagent_command_path)" >&2; return 64 ;;',
         "    esac",
         "}",
         "foamagent_require_mesh_ok() {",

@@ -22,6 +22,7 @@ from .output_safety import (
     prepare_output_directory,
     validate_output_path,
 )
+from openfoam_target import ESI_V2006, normalise_openfoam_target
 
 
 MAX_ARCHIVE_FILES = 10_000
@@ -465,8 +466,14 @@ def import_case(
     *,
     case_subdir: Optional[str] = None,
     overwrite: bool = False,
+    openfoam_target: str = "",
 ) -> CaseManifest:
-    """Validate a source then materialise ``original/``, ``work/``, and ``report/``."""
+    """Validate a source then materialise ``original/``, ``work/``, and ``report/``.
+
+    An empty target keeps the historical Foundation-v10-only import policy.
+    The explicit ``esi-v2006`` target accepts only a detected ESI v2006 case.
+    """
+    requested_target = normalise_openfoam_target(openfoam_target)
     source_path = Path(case_path).expanduser().resolve()
     if not source_path.exists():
         raise CaseImportError(f"Case input does not exist: {source_path}")
@@ -497,7 +504,11 @@ def import_case(
         try:
             mesh_state = _mesh_state(selected_root)
             plan = (
-                parse_allrun(allrun_content, application)
+                parse_allrun(
+                    allrun_content,
+                    application,
+                    platform=ESI_V2006 if requested_target == ESI_V2006 else platform,
+                )
                 if source_allrun.is_file()
                 else synthesise_execution_plan(application, mesh_state)
             )
@@ -507,7 +518,16 @@ def import_case(
         except CaseImportError as exc:
             blocking_issues.append(str(exc))
             plan = []
-        if platform not in {"foundation-v10", "foundation-v10-compatible"}:
+        if requested_target == ESI_V2006:
+            if platform == "esi" and version and version.lstrip("vV") == "2006":
+                platform = ESI_V2006
+            else:
+                blocking_issues.append(
+                    "Configured target is ESI/OpenCFD OpenFOAM v2006, but the imported "
+                    "case is not an ESI v2006 case; "
+                    f"detected platform is {platform}{f' ({version})' if version else ''}."
+                )
+        elif platform not in {"foundation-v10", "foundation-v10-compatible"}:
             blocking_issues.append(
                 "Only Foundation OpenFOAM v10 cases are supported by case-import mode; "
                 f"detected platform is {platform}{f' ({version})' if version else ''}."

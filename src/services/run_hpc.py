@@ -3,9 +3,42 @@ import os
 import json
 import subprocess
 import re
+import shlex
 from models import HPCScriptIn, HPCScriptOut, RunIn, RunOut, JobStatusIn, JobStatusOut
 from utils import check_foam_errors, save_file
 from . import global_llm_service
+
+
+def _add_esi_v2006_runtime_guard(
+    script_content: str,
+    openfoam_target: str,
+    *,
+    openfoam_bashrc: str = "",
+) -> str:
+    """Make an explicit v2006 cluster job fail before it touches the case."""
+    if openfoam_target != "esi-v2006":
+        return script_content
+    if not openfoam_bashrc or not openfoam_bashrc.strip():
+        raise ValueError(
+            "Native esi-v2006 HPC jobs require FOAMAGENT_HPC_OPENFOAM_BASHRC "
+            "to identify the trusted cluster-side v2006 etc/bashrc."
+        )
+    bashrc = openfoam_bashrc.strip()
+    if "\n" in bashrc or "\r" in bashrc:
+        raise ValueError("FOAMAGENT_HPC_OPENFOAM_BASHRC must be a single bashrc path.")
+    quoted_bashrc = shlex.quote(bashrc)
+    guard = (
+        f'if [ ! -f {quoted_bashrc} ]; then echo "Configured ESI v2006 bashrc is unavailable." >&2; exit 64; fi\n'
+        f"source {quoted_bashrc} || exit $?\n"
+        'case "${WM_PROJECT_VERSION:-}" in\n'
+        "    v2006|2006) ;;\n"
+        "    *) echo \"Foam-Agent requires ESI/OpenCFD OpenFOAM v2006 on this cluster.\" >&2; exit 64 ;;\n"
+        "esac\n"
+    )
+    lines = script_content.splitlines()
+    if lines and lines[0].startswith("#!"):
+        return "\n".join([lines[0], guard.rstrip("\n"), *lines[1:]]) + "\n"
+    return guard + script_content
 
 
 def create_slurm_script(
@@ -13,6 +46,8 @@ def create_slurm_script(
     cluster_info: dict,
     *,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
+    openfoam_bashrc: str = "",
 ) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM.
@@ -34,8 +69,13 @@ def create_slurm_script(
         "4. Directory navigation and execution of the Allrun script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
-        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript."
-        ""
+        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
+    ) + (
+        "8. The already-loaded OpenFOAM environment must be ESI/OpenCFD v2006. "
+        "Do not substitute Foundation OpenFOAM commands or dictionaries."
+        if openfoam_target == "esi-v2006"
+        else ""
+    ) + (
         "Return ONLY the complete SLURM script content. Do not include any explanations or markdown formatting."
         "Make sure the script is executable and follows best practices for the specified cluster."
     )
@@ -71,6 +111,11 @@ def create_slurm_script(
     if not script_content.startswith('#!/bin/bash'):
         script_content = '#!/bin/bash\n' + script_content
     
+    script_content = _add_esi_v2006_runtime_guard(
+        script_content,
+        openfoam_target,
+        openfoam_bashrc=openfoam_bashrc,
+    )
     script_path = os.path.join(case_dir, "submit_job.slurm")
     save_file(script_path, script_content)
     return script_path
@@ -83,6 +128,8 @@ def create_slurm_script_with_error_context(
     previous_script_content: str = "",
     *,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
+    openfoam_bashrc: str = "",
 ) -> str:
     """
     Create a SLURM script for OpenFOAM simulation using LLM, with error context for retries.
@@ -106,8 +153,13 @@ def create_slurm_script_with_error_context(
         "4. Directory navigation and execution of the Allrun script"
         "5. Error handling and status reporting"
         "6. Any cluster-specific optimizations or requirements"
-        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript."
-        ""
+        "7. Use your understanding of the documentation of the cluster and figure out the syntax of their jobscript. "
+    ) + (
+        "8. The already-loaded OpenFOAM environment must be ESI/OpenCFD v2006. "
+        "Do not substitute Foundation OpenFOAM commands or dictionaries."
+        if openfoam_target == "esi-v2006"
+        else ""
+    ) + (
         "If a previous script and error message are provided, analyze the error and the script "
         "to identify what went wrong and fix it. Common issues to consider:"
         "- Invalid account numbers or partitions"
@@ -161,6 +213,11 @@ def create_slurm_script_with_error_context(
     if not script_content.startswith('#!/bin/bash'):
         script_content = '#!/bin/bash\n' + script_content
     
+    script_content = _add_esi_v2006_runtime_guard(
+        script_content,
+        openfoam_target,
+        openfoam_bashrc=openfoam_bashrc,
+    )
     script_path = os.path.join(case_dir, "submit_job.slurm")
     save_file(script_path, script_content)
     return script_path
@@ -193,8 +250,19 @@ def check_job_status(job_id: str) -> Tuple[Optional[str], bool, str]:
         return None, False, f"Unexpected error: {str(e)}"
 
 
-def generate_hpc_script(inp: HPCScriptIn, case_dir: str) -> HPCScriptOut:
-    script_path = create_slurm_script(case_dir, inp.hpc_config)
+def generate_hpc_script(
+    inp: HPCScriptIn,
+    case_dir: str,
+    *,
+    openfoam_target: str = "",
+    openfoam_bashrc: str = "",
+) -> HPCScriptOut:
+    script_path = create_slurm_script(
+        case_dir,
+        inp.hpc_config,
+        openfoam_target=openfoam_target,
+        openfoam_bashrc=openfoam_bashrc,
+    )
     with open(script_path, "r") as f:
         content = f.read()
     return HPCScriptOut(script_content=content, script_path=script_path)
@@ -355,4 +423,3 @@ def wait_for_job(job_id: str, max_wait_time: int = 3600, wait_interval: int = 30
         time.sleep(wait_interval)
         elapsed += wait_interval
     return last_status or "TIMEOUT", True, ""
-

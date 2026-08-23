@@ -5,6 +5,7 @@ from typing import Any
 from nodes.imported_case_node import run_imported_case_attempt
 from services.run_local import run_allrun_and_collect_errors
 from logger import log_review
+from openfoam_target import runtime_target_for_config
 
 
 def local_runner_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -40,7 +41,11 @@ def local_runner_node(state: dict[str, Any]) -> dict[str, Any]:
     print("<runner>")
 
     # Execute using service and collect errors
-    error_logs = run_allrun_and_collect_errors(case_dir, max_time_limit)
+    error_logs = run_allrun_and_collect_errors(
+        case_dir,
+        max_time_limit,
+        openfoam_target=runtime_target_for_config(state["config"]),
+    )
 
     if len(error_logs) > 0:
         print("Errors detected in the Allrun execution.")
@@ -55,4 +60,3 @@ def local_runner_node(state: dict[str, Any]) -> dict[str, Any]:
         **state,
         "error_logs": error_logs
     }
-        

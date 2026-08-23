@@ -123,6 +123,9 @@ OpenFOAM + LLM Services
 | `FOAMAGENT_EMBEDDING_PROVIDER` | Embedding backend | `huggingface` |
 | `FOAMAGENT_EMBEDDING_MODEL` | Embedding model | `Qwen/Qwen3-Embedding-0.6B` |
 | `FOAMAGENT_OPENFOAM_FORK` | OpenFOAM target fork for generated files: `foundation` or `esi` | `foundation` |
+| `FOAMAGENT_OPENFOAM_TARGET` | Explicit native target: `foundation-v10` or `esi-v2006`; v2006 bypasses legacy ESI translation | — |
+| `FOAMAGENT_ESI_V2006_DATABASE_PATH` | Optional isolated v2006 tutorial/FAISS corpus root | `database/esi-v2006` |
+| `FOAMAGENT_HPC_OPENFOAM_BASHRC` | Trusted v2006 `etc/bashrc` sourced in native HPC job scripts | — |
 | `OPENAI_API_KEY` | OpenAI API key | — |
 | `ANTHROPIC_API_KEY` | Anthropic API key | — |
 
@@ -135,8 +138,9 @@ OpenFOAM + LLM Services
 python init_database.py --openfoam_path $WM_PROJECT_DIR --force
 ```
 
-**OpenFOAM not found:** The default validated runtime path requires Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)). If using ESI OpenFOAM, set `FOAMAGENT_OPENFOAM_FORK=esi` and verify the generated case against your local ESI installation. Install Foundation v10 or use the Docker image:
+**OpenFOAM not found:** The default validated runtime path requires Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)). Legacy generic ESI uses `FOAMAGENT_OPENFOAM_FORK=esi`; native v2006 uses `FOAMAGENT_OPENFOAM_TARGET=esi-v2006`, a v2006 target corpus, and `WM_PROJECT_VERSION=v2006`. For a native HPC run set `FOAMAGENT_HPC_OPENFOAM_BASHRC` to the compute-node v2006 `etc/bashrc`. Build the matching image with:
 ```bash
-docker build -f docker/Dockerfile -t foamagent:latest .
-docker run -it -p 7860:7860 foamagent:latest foamagent-mcp --transport http
+python scripts/build_docker_image.py
+python scripts/build_docker_image.py --openfoam-target esi-v2006
+docker run -it -p 7860:7860 foamagent:foundation-v10 foamagent-mcp --transport http
 ```

@@ -123,10 +123,17 @@ def execute_imported_case(
     controlled_dir = case_dir / ".foamagent"
     controlled_dir.mkdir(exist_ok=True)
     controlled_script = controlled_dir / "Allrun.controlled"
-    script_content = render_controlled_allrun(manifest.execution_plan)
+    script_content = render_controlled_allrun(
+        manifest.execution_plan,
+        platform=manifest.platform,
+    )
     controlled_script.write_text(script_content, encoding="utf-8")
 
-    preflight = validate_openfoam_case_preflight(str(case_dir), script_content)
+    preflight = validate_openfoam_case_preflight(
+        str(case_dir),
+        script_content,
+        openfoam_target=manifest.platform,
+    )
     if preflight:
         return preflight
 
@@ -134,12 +141,18 @@ def execute_imported_case(
     out_file = case_dir / "Allrun.import.out"
     err_file = case_dir / "Allrun.import.err"
     try:
+        command_kwargs = (
+            {"openfoam_target": manifest.platform}
+            if manifest.platform == "esi-v2006"
+            else {}
+        )
         command_result = run_command(
             str(controlled_script),
             str(out_file),
             str(err_file),
             str(case_dir),
             timeout,
+            **command_kwargs,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         return [{"file": "Allrun", "error_content": str(exc)}]

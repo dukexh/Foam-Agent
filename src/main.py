@@ -5,6 +5,11 @@ from pathlib import Path
 from utils import LLMService, GraphState
 
 from config import Config
+from openfoam_target import (
+    database_path_for_config,
+    normalise_openfoam_target,
+    require_target_corpus,
+)
 from nodes.planner_node import planner_node
 from nodes.meshing_node import meshing_node
 from nodes.input_writer_node import input_writer_node
@@ -29,6 +34,11 @@ import json
 def workflow_entry_node(_state: GraphState) -> dict:
     """Provide one graph entry point before routing by input mode."""
     return {}
+
+
+def workflow_exit_code(state: GraphState) -> int:
+    """Return a non-zero process status for any terminal workflow failure."""
+    return 2 if state.get("termination_reason") else 0
 
 
 def create_foam_agent_graph() -> StateGraph:
@@ -80,7 +90,8 @@ def initialize_state(
     case_stats = None
     llm_service = None
     if workflow_mode == "prompt":
-        case_stats_path = Path(config.database_path) / "raw" / "openfoam_case_stats.json"
+        require_target_corpus(config)
+        case_stats_path = database_path_for_config(config) / "raw" / "openfoam_case_stats.json"
         with case_stats_path.open(encoding="utf-8") as case_stats_file:
             case_stats = json.load(case_stats_file)
         llm_service = LLMService(config)
@@ -171,8 +182,11 @@ def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] 
         result = app.invoke(initial_state, config={"recursion_limit": config.recursion_limit})
 
         termination_reason = result.get("termination_reason")
-        if termination_reason == "max_review_loop_reached":
-            print("<workflow_end>Workflow finished after reaching the maximum review loop limit.</workflow_end>")
+        if termination_reason:
+            print(
+                "<workflow_end>Workflow stopped without completing successfully: "
+                f"{termination_reason}</workflow_end>"
+            )
         else:
             print("<workflow_end>Workflow completed successfully!</workflow_end>")
 
@@ -259,8 +273,8 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help=(
-            "Existing Foundation OpenFOAM v10 case directory or ZIP archive. "
-            "This bypasses prompt generation and runs only validated case commands."
+            "Existing OpenFOAM case directory or ZIP archive. This defaults to "
+            "Foundation v10; use --openfoam_target esi-v2006 for ESI v2006."
         ),
     )
     parser.add_argument(
@@ -277,6 +291,15 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Output directory for the workflow.",
+    )
+    parser.add_argument(
+        "--openfoam_target",
+        type=str,
+        default=None,
+        help=(
+            "Explicit native OpenFOAM target. Use esi-v2006 for ESI/OpenCFD "
+            "v2006; omit it to preserve the existing Foundation/generic-ESI path."
+        ),
     )
     parser.add_argument(
         "--custom_mesh_path",
@@ -309,6 +332,13 @@ if __name__ == "__main__":
     
     # Initialize configuration.
     config = Config()
+
+    if args.openfoam_target is not None:
+        try:
+            config.openfoam_target = normalise_openfoam_target(args.openfoam_target)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(f"<config>openfoam_target={config.openfoam_target} (cli)</config>")
 
     print(f"config: {config}")
 
@@ -345,5 +375,5 @@ if __name__ == "__main__":
             user_requirement = f.read()
 
         final_state = main(user_requirement, config, args.custom_mesh_path)
-        if final_state.get("termination_reason") == "max_review_loop_reached":
-            raise SystemExit(2)
+        if exit_code := workflow_exit_code(final_state):
+            raise SystemExit(exit_code)

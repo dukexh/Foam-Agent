@@ -21,6 +21,7 @@ from services.case_import import (
     repair_imported_case_attempt,
     write_import_attempt_report,
 )
+from openfoam_target import configured_openfoam_target
 
 
 def case_import_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -32,6 +33,7 @@ def case_import_node(state: dict[str, Any]) -> dict[str, Any]:
             state["config"].case_dir,
             case_subdir=state.get("case_import_subdir"),
             overwrite=state["config"].overwrite_case_dir,
+            openfoam_target=configured_openfoam_target(state["config"]),
         )
     except CaseImportError as exc:
         error = {"file": "case_import", "error_content": str(exc)}

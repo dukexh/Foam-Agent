@@ -86,6 +86,60 @@ def test_initial_node_uses_selected_solver_fork_and_requirement(monkeypatch, tmp
     assert captured["allrun"]["user_requirement"] == requirement
 
 
+def test_initial_node_routes_native_esi_v2006_without_legacy_translation(
+    monkeypatch,
+    tmp_path,
+):
+    writer_node = importlib.import_module("nodes.input_writer_node")
+    captured = {}
+
+    def fake_initial_write(**kwargs):
+        captured["initial"] = kwargs
+        return {"dir_structure": {}, "foamfiles": FoamPydantic(list_foamfile=[])}
+
+    def fake_build_allrun(**kwargs):
+        captured["allrun"] = kwargs
+        return {"allrun_path": str(tmp_path / "Allrun"), "allrun_script": "", "commands": []}
+
+    def legacy_translator_must_not_run(*_args):
+        raise AssertionError("esi-v2006 must not call the legacy ESI translator")
+
+    monkeypatch.setattr(writer_node, "initial_write", fake_initial_write)
+    monkeypatch.setattr(writer_node, "build_allrun", fake_build_allrun)
+    monkeypatch.setattr(writer_node, "convert_case_to_esi_if_needed", legacy_translator_must_not_run)
+    monkeypatch.setattr(writer_node, "scan_case_directory", lambda *_: {})
+    monkeypatch.setattr(writer_node, "read_case_foamfiles", lambda *_: FoamPydantic(list_foamfile=[]))
+
+    class Config:
+        input_writer_generation_mode = "sequential_dependency"
+        reuse_generated_dir = ""
+        openfoam_fork = "esi"
+        openfoam_target = "esi-v2006"
+        database_path = str(tmp_path / "database")
+        searchdocs = 3
+
+    writer_node.input_writer_node(
+        {
+            "input_writer_mode": "initial",
+            "config": Config(),
+            "case_dir": str(tmp_path / "case"),
+            "subtasks": [],
+            "user_requirement": "Generate a v2006 case.",
+            "tutorial_reference": "",
+            "case_solver": "simpleFoam",
+            "case_stats": {},
+            "similar_case_advice": None,
+            "case_info": "case solver: simpleFoam",
+            "allrun_reference": "",
+            "mesh_type": "standard_mesh",
+            "mesh_commands": [],
+        }
+    )
+
+    assert captured["initial"]["openfoam_fork"] == "esi-v2006"
+    assert captured["allrun"]["database_path"].endswith("database/esi-v2006")
+
+
 def test_rewrite_node_passes_selected_solver_and_fork(monkeypatch, tmp_path):
     writer_node = importlib.import_module("nodes.input_writer_node")
     captured = {}

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
+from openfoam_target import ESI_V2006
+
 
 class CaseImportError(ValueError):
     """Raised when a case cannot safely enter import mode."""
@@ -50,6 +52,7 @@ class CaseManifest:
         return not self.blocking_issues and self.platform in {
             "foundation-v10",
             "foundation-v10-compatible",
+            ESI_V2006,
         }
 
     def to_dict(self) -> dict[str, Any]:

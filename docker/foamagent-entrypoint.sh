@@ -1,6 +1,11 @@
 #!/bin/bash
 set -e
 
+if [ "${FOAMAGENT_OPENFOAM_TARGET:-}" = "esi-v2006" ]; then
+    echo "ERROR: this image contains Foundation OpenFOAM v10. Build/run foamagent:esi-v2006 instead." >&2
+    exit 64
+fi
+
 # Source OpenFOAM environment in a controlled way: allow non-zero RC, then validate
 set +e
 source /opt/openfoam10/etc/bashrc
@@ -122,4 +127,3 @@ if [ "$1" = "/bin/bash" ] || [ "$1" = "bash" ] || [ -z "$1" ]; then
 else
     exec "$@"
 fi
-

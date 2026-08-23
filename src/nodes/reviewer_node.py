@@ -5,6 +5,7 @@ from typing import Any
 from nodes.imported_case_node import repair_imported_case
 from services.review import review_error_logs, generate_rewrite_plan
 from logger import log_review
+from openfoam_target import generation_convention
 
 
 def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -42,6 +43,7 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
         similar_case_advice=state.get('similar_case_advice'),
         history_text=history_text,
         llm_service=state.get("llm_service"),
+        openfoam_target=generation_convention(state["config"]),
     )
 
     log_review(review_content, "review_analysis")
@@ -52,6 +54,7 @@ def reviewer_node(state: dict[str, Any]) -> dict[str, Any]:
         review_analysis=review_content,
         user_requirement=state.get('user_requirement', ''),
         llm_service=state.get("llm_service"),
+        openfoam_target=generation_convention(state["config"]),
     )
     log_review(str(rewrite_plan), "rewrite_plan")
 

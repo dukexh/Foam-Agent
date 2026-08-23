@@ -20,6 +20,7 @@ import threading
 from botocore.exceptions import ClientError
 import shutil
 from config import Config
+from openfoam_target import database_path_for_config, require_target_corpus
 from langchain_ollama import ChatOllama
 try:
     from langchain_huggingface import HuggingFaceEmbeddings
@@ -38,11 +39,8 @@ _FAISS_DB_CACHE_LOCK = threading.RLock()
 
 
 def _configured_database_path(config: Config) -> Path:
-    """Resolve the configured database root without silently using the repo one."""
-    configured_path = getattr(config, "database_path", None)
-    if not configured_path:
-        configured_path = Path(__file__).resolve().parent.parent / "database"
-    return Path(configured_path).expanduser().resolve()
+    """Resolve the platform-scoped database root for one configuration."""
+    return database_path_for_config(config)
 
 
 def _faiss_cache_key(config: Config) -> FAISSCacheKey:
@@ -79,6 +77,7 @@ def get_embedding_model(config: Optional[Config] = None):
 
 def load_faiss_dbs(config: Optional[Config] = None):
     cfg = config or Config()
+    require_target_corpus(cfg)
     embedding_model = get_embedding_model(cfg)
 
     base_dir = _configured_database_path(cfg) / "faiss"
@@ -1122,6 +1121,8 @@ def run_command(
     err_file: str,
     working_dir: str,
     max_time_limit: int,
+    *,
+    openfoam_target: str = "",
 ) -> Dict[str, Any]:
     """Run an OpenFOAM shell script and return its process outcome.
 
@@ -1148,13 +1149,33 @@ def run_command(
     # legitimately contain spaces and, for imported cases, originate outside
     # Foam-Agent.  Passing them as positional parameters prevents shell
     # metacharacters from being interpreted as code.
-    shell_command = 'source "$1" && exec bash "$2"'
+    # The explicit v2006 target must never accidentally execute against a
+    # sourced Foundation (or a different ESI) installation.  Legacy callers
+    # pass the empty value and retain the exact historical command shape.
+    shell_command = (
+        'source "$1" || exit $?; '
+        'if [ "$3" = "esi-v2006" ]; then '
+        'case "${WM_PROJECT_VERSION:-}" in v2006|2006) ;; '
+        '*) echo "Foam-Agent requires ESI/OpenCFD OpenFOAM v2006; '
+        'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64 ;; '
+        'esac; '
+        'fi; '
+        'exec bash "$2"'
+    )
 
     timed_out = False
 
     with open(out_file, 'w') as out, open(err_file, 'w') as err:
         process = subprocess.Popen(
-            ["bash", "-c", shell_command, "foamagent-runner", str(bashrc_path), str(script)],
+            [
+                "bash",
+                "-c",
+                shell_command,
+                "foamagent-runner",
+                str(bashrc_path),
+                str(script),
+                openfoam_target,
+            ],
             cwd=working_dir,
             # Stream child output directly to disk.  ``communicate()`` buffers
             # all solver output in memory and can OOM on a legitimate long CFD
@@ -1188,6 +1209,68 @@ def run_command(
         "returncode": process.returncode,
         "timed_out": timed_out,
     }
+
+
+def run_openfoam_utility(
+    command: List[str],
+    *,
+    working_dir: str,
+    timeout: int,
+    openfoam_target: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """Execute one OpenFOAM utility with the requested native runtime.
+
+    Legacy callers retain direct ``subprocess.run`` behaviour.  Native v2006
+    mesh preprocessing happens before an ``Allrun`` exists, so it must source
+    and validate the selected installation itself instead of relying on a
+    later runner guard.
+    """
+    if not command:
+        raise ValueError("OpenFOAM utility command must not be empty.")
+
+    run_kwargs = {
+        "cwd": working_dir,
+        "check": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "timeout": timeout,
+    }
+    if openfoam_target != "esi-v2006":
+        return subprocess.run(command, **run_kwargs)
+
+    openfoam_dir = os.getenv("WM_PROJECT_DIR")
+    if not openfoam_dir:
+        raise RuntimeError(
+            "Native esi-v2006 mesh processing requires WM_PROJECT_DIR. "
+            "Pass --openfoam_path <ESI-v2006-root> or source its etc/bashrc."
+        )
+    bashrc_path = Path(openfoam_dir).expanduser() / "etc" / "bashrc"
+    if not bashrc_path.is_file():
+        raise RuntimeError(f"OpenFOAM bashrc not found at: {bashrc_path}")
+
+    shell_command = (
+        'source "$1" || exit $?; '
+        'target="$2"; shift 2; '
+        'case "$target:${WM_PROJECT_VERSION:-}" in '
+        'esi-v2006:v2006|esi-v2006:2006) ;; '
+        '*) echo "Foam-Agent requires ESI/OpenCFD OpenFOAM v2006; '
+        'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64 ;; '
+        'esac; '
+        'exec "$@"'
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            shell_command,
+            "foamagent-utility",
+            str(bashrc_path),
+            openfoam_target,
+            *command,
+        ],
+        **run_kwargs,
+    )
 
 _EXPLICIT_FOAM_ERROR_RE = re.compile(r"ERROR:(.*)", re.DOTALL)
 _SEMANTIC_FOAM_FAILURES = (

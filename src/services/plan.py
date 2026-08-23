@@ -5,6 +5,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from utils import retrieve_faiss, parse_directory_structure
 from config import Config
+from openfoam_target import generation_convention
 from . import global_llm_service
 from .case_paths import CasePathSafetyError, safe_case_relative_path
 
@@ -30,6 +31,7 @@ def parse_requirement_to_case_info(
     case_stats: Dict[str, List[str]],
     *,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
 ) -> Dict[str, str]:
     """
     Parse user requirements into structured case information using LLM.
@@ -74,6 +76,12 @@ def parse_requirement_to_case_info(
         f"Note: case domain must be one of {case_stats.get('case_domain', [])}."
         f"Note: case category must be one of {case_stats.get('case_category', [])}."
         f"Note: case solver must be one of {case_stats.get('case_solver', [])}."
+        + (
+            " The selected native runtime is ESI/OpenCFD OpenFOAM v2006. "
+            "Choose only a solver present in the supplied v2006 case statistics."
+            if openfoam_target == "esi-v2006"
+            else ""
+        )
     )
     parse_user_prompt = f"User requirement: {user_requirement}."
     llm_client = llm_service if llm_service is not None else global_llm_service
@@ -536,6 +544,7 @@ def decompose_to_subtasks(
     dir_counts_str: str,
     *,
     llm_service: Optional[Any] = None,
+    openfoam_target: str = "",
 ) -> List[Dict]:
     decompose_system_prompt = (
         "You are an experienced Planner specializing in OpenFOAM projects. "
@@ -545,6 +554,12 @@ def decompose_to_subtasks(
         "```\n{\n  \"subtasks\": [\n    {\n      \"file_name\": \"<string>\",\n      \"folder_name\": \"<string>\"\n    }\n    // ... more subtasks\n  ]\n}\n```\n\n"
         "Make sure that your output is valid JSON and strictly adheres to the provided schema."
         "Make sure you generate all the necessary files for the user's requirements."
+        + (
+            " The target is native ESI/OpenCFD OpenFOAM v2006. Select only "
+            "the file and dictionary layout present in the supplied v2006 reference."
+            if openfoam_target == "esi-v2006"
+            else ""
+        )
     )
 
     decompose_user_prompt = (
@@ -601,10 +616,12 @@ def generate_simulation_plan(
         RuntimeError: If any step in the planning process fails
     """
     # Step 1: Parse user requirement to case info
+    target_convention = generation_convention(config) if config is not None else ""
     case_info = parse_requirement_to_case_info(
         user_requirement,
         case_stats,
         llm_service=llm_service,
+        openfoam_target=target_convention,
     )
     case_name = case_info["case_name"]
     case_domain = case_info["case_domain"]
@@ -641,6 +658,7 @@ def generate_simulation_plan(
         dir_structure,
         dir_counts_str,
         llm_service=llm_service,
+        openfoam_target=target_convention,
     )
     
     if len(subtasks) == 0:
