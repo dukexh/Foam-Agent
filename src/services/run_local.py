@@ -438,7 +438,7 @@ def _cleanup_run_artifacts(case_dir: str) -> None:
             if entry.is_symlink():
                 # A case output symlink is not a valid solver artifact, but
                 # unlinking the link never follows it.
-                if entry.name.startswith("log"):
+                if entry.name.startswith("log") or entry.name in {"Allrun.out", "Allrun.err"}:
                     entry.unlink()
                 continue
             if entry.is_file() and (

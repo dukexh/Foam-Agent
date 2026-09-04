@@ -23,11 +23,15 @@ from openfoam_target import (  # noqa: E402
     uses_legacy_esi_translation,
 )
 from services.case_import import (  # noqa: E402
+    _clear_attempt_artifacts,
     apply_safe_repairs,
     import_case,
     render_controlled_allrun,
     numeric_signature,
 )
+from services.plan import _crop_file_content  # noqa: E402
+from services.run_local import _cleanup_run_artifacts  # noqa: E402
+from utils import remove_file  # noqa: E402
 from services.output_safety import (  # noqa: E402
     OutputDirectorySafetyError,
     prepare_output_directory,
@@ -173,3 +177,36 @@ def test_safe_import_repair_preserves_numeric_tokens(tmp_path) -> None:
     assert any(repair["status"] == "applied" for repair in repairs)
     assert "object controlDict;" in control_dict.read_text(encoding="utf-8")
     assert numeric_signature(control_dict.read_text(encoding="utf-8")) == before
+
+
+def test_cleanup_unlinks_output_symlinks_without_touching_targets(tmp_path) -> None:
+    case = tmp_path / "case"
+    case.mkdir()
+    external = tmp_path / "external.log"
+    external.write_text("keep", encoding="utf-8")
+    (case / "Allrun.out").symlink_to(external)
+    (case / "Allrun.err").symlink_to(external)
+    (case / "12").symlink_to(tmp_path / "external-time", target_is_directory=True)
+    (case / "Allrun.import.out").symlink_to(tmp_path / "missing-output")
+    dangling_hpc_output = case / "HPC.out"
+    dangling_hpc_output.symlink_to(tmp_path / "missing-hpc-output")
+
+    _cleanup_run_artifacts(str(case))
+    _clear_attempt_artifacts(case)
+    remove_file(str(dangling_hpc_output))
+
+    assert not (case / "Allrun.out").is_symlink()
+    assert not (case / "Allrun.err").is_symlink()
+    assert not (case / "12").is_symlink()
+    assert not (case / "Allrun.import.out").is_symlink()
+    assert not dangling_hpc_output.is_symlink()
+    assert external.read_text(encoding="utf-8") == "keep"
+
+
+def test_reference_crop_keeps_content_within_allocated_budget() -> None:
+    content = "important reference content\n" * 20
+    result = _crop_file_content(content, 80)
+
+    assert len(result) <= 80
+    assert result.startswith("important reference")
+    assert "reference content omitted" in result

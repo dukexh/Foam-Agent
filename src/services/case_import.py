@@ -700,7 +700,10 @@ def import_case(case_path: str | Path, output_dir: str | Path, *, case_subdir: O
 
 def _clear_attempt_artifacts(case_dir: Path) -> None:
     for path in case_dir.iterdir():
-        if path.is_file() and (path.name.startswith("log.") or path.name in {"Allrun.import.out", "Allrun.import.err"}):
+        if (path.is_symlink() or path.is_file()) and (
+            path.name.startswith("log.")
+            or path.name in {"Allrun.import.out", "Allrun.import.err"}
+        ):
             path.unlink()
 
 

@@ -25,6 +25,19 @@ TARGET_SOURCES = {
         "release": "ESI/OpenCFD OpenFOAM v2006",
     },
 }
+REQUIRED_RAW_CORPUS_FILES = (
+    "openfoam_case_stats.json",
+    "openfoam_command_help.txt",
+    "openfoam_allrun_scripts.txt",
+    "openfoam_tutorials_structure.txt",
+    "openfoam_tutorials_details.txt",
+)
+REQUIRED_FAISS_INDICES = (
+    "openfoam_command_help",
+    "openfoam_allrun_scripts",
+    "openfoam_tutorials_structure",
+    "openfoam_tutorials_details",
+)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Initialize database for Foam-Agent project")
@@ -114,6 +127,19 @@ def run_command(command_str):
 def _embedding_index_dir(database_dir: Path, embedding_model: str) -> Path:
     """Return the FAISS model directory using the runtime's naming rule."""
     return database_dir / "faiss" / embedding_model.replace("/", "_").replace(":", "_")
+
+
+def _raw_corpus_is_complete(raw_dir: Path) -> bool:
+    return all(
+        (raw_dir / filename).is_file() for filename in REQUIRED_RAW_CORPUS_FILES
+    )
+
+
+def _faiss_index_is_complete(index_dir: Path) -> bool:
+    return (
+        (index_dir / "index.faiss").is_file()
+        and (index_dir / "index.pkl").is_file()
+    )
 
 
 def _read_openfoam_version(openfoam_root: str) -> str:
@@ -215,7 +241,7 @@ def main():
     SCRIPTS = []
     
     # Preprocess the OpenFOAM tutorials
-    if args.force or not (raw_dir / "openfoam_tutorials_details.txt").exists():
+    if args.force or not _raw_corpus_is_complete(raw_dir):
         SCRIPTS.append(
             f"{shlex.quote(sys.executable)} database/script/tutorial_parser.py "
             f"--output_dir={output_arg} --wm_project_dir={openfoam_arg} "
@@ -227,13 +253,25 @@ def main():
     # only for *any* FAISS index made a second provider/model silently reuse a
     # missing target index instead of building it.
     python_executable = shlex.quote(sys.executable)
-    if not args.raw_only and (args.force or not (selected_index_dir / "openfoam_command_help").is_dir()):
+    if not args.raw_only and (
+        args.force
+        or not _faiss_index_is_complete(selected_index_dir / "openfoam_command_help")
+    ):
         SCRIPTS.append(f"{python_executable} database/script/faiss_command_help.py --database_path={database_arg}{embedding_args}")
-    if not args.raw_only and (args.force or not (selected_index_dir / "openfoam_allrun_scripts").is_dir()):
+    if not args.raw_only and (
+        args.force
+        or not _faiss_index_is_complete(selected_index_dir / "openfoam_allrun_scripts")
+    ):
         SCRIPTS.append(f"{python_executable} database/script/faiss_allrun_scripts.py --database_path={database_arg}{embedding_args}")
-    if not args.raw_only and (args.force or not (selected_index_dir / "openfoam_tutorials_structure").is_dir()):
+    if not args.raw_only and (
+        args.force
+        or not _faiss_index_is_complete(selected_index_dir / "openfoam_tutorials_structure")
+    ):
         SCRIPTS.append(f"{python_executable} database/script/faiss_tutorials_structure.py --database_path={database_arg}{embedding_args}")
-    if not args.raw_only and (args.force or not (selected_index_dir / "openfoam_tutorials_details").is_dir()):
+    if not args.raw_only and (
+        args.force
+        or not _faiss_index_is_complete(selected_index_dir / "openfoam_tutorials_details")
+    ):
         SCRIPTS.append(f"{python_executable} database/script/faiss_tutorials_details.py --database_path={database_arg}{embedding_args}")
 
     if not SCRIPTS:

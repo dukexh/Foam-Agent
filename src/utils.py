@@ -989,9 +989,21 @@ def remove_files(directory: str, prefix: str) -> None:
     print(f"Removed files with prefix '{prefix}' in {directory}")
 
 def remove_file(path: str) -> None:
-    if os.path.exists(path):
+    # ``exists`` is false for dangling symlinks.  ``lexists`` lets us unlink
+    # the link itself without ever following its target.
+    if os.path.lexists(path):
         os.remove(path)
         print(f"Removed file {path}")
+
+
+def _is_numeric_name(name: str) -> bool:
+    """Return whether a case entry name represents an OpenFOAM time value."""
+    try:
+        float(name)
+    except ValueError:
+        return False
+    return True
+
 
 def remove_numeric_folders(case_dir: str) -> None:
     """
@@ -1003,19 +1015,24 @@ def remove_numeric_folders(case_dir: str) -> None:
     """
     for item in os.listdir(case_dir):
         item_path = os.path.join(case_dir, item)
-        if os.path.isdir(item_path) and item != "0":
-            try:
-                # Try to convert to float to check if it's a numeric value
-                float(item)
-                # If conversion succeeds, it's a numeric folder
+        if item == "0":
+            continue
+        # Never follow a numeric symlink while cleaning solver output.  A
+        # retry must remove the link itself, not traverse or delete its target.
+        if os.path.islink(item_path):
+            if _is_numeric_name(item):
                 try:
-                    shutil.rmtree(item_path)
-                    print(f"Removed numeric folder: {item_path}")
+                    os.unlink(item_path)
+                    print(f"Removed numeric symlink: {item_path}")
                 except OSError as e:
-                    print(f"Error removing folder {item_path}: {str(e)}")
-            except ValueError:
-                # Not a numeric value, so we keep this folder
-                pass
+                    print(f"Error removing symlink {item_path}: {str(e)}")
+            continue
+        if os.path.isdir(item_path) and _is_numeric_name(item):
+            try:
+                shutil.rmtree(item_path)
+                print(f"Removed numeric folder: {item_path}")
+            except OSError as e:
+                print(f"Error removing folder {item_path}: {str(e)}")
 
 
 def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:

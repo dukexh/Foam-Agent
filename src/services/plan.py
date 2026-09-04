@@ -258,7 +258,7 @@ def _crop_file_content(content: str, budget: int) -> str:
     marker = f"\n/* [reference content omitted; original_chars={len(content)}] */\n"
     if budget <= len(marker):
         return marker[:budget]
-    return marker
+    return content[: budget - len(marker)] + marker
 
 
 def _truncate_large_reference_files(
