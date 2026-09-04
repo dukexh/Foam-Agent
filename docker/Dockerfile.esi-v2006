@@ -1,0 +1,114 @@
+# Native ESI/OpenCFD v2006 Foam-Agent image.
+# Build through scripts/build_docker_image.py so the target tag and runtime
+# environment are always selected together.
+
+FROM ubuntu:20.04 AS openfoam-builder
+
+ARG OPENFOAM_VERSION=v2006
+ARG OPENFOAM_MD5=1226d48e74a4c78f12396cb586c331d8
+ARG THIRD_PARTY_MD5=6b598b6faa6ddeb25235c5dded0ca275
+ARG OPENFOAM_BUILD_JOBS=4
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN for attempt in 1 2 3; do \
+        apt-get -o Acquire::Retries=5 update && \
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
+            build-essential bison flex cmake curl file gawk git libboost-system-dev \
+            libopenmpi-dev openmpi-bin mpi-default-bin perl python3 python3-dev \
+            tcsh zlib1g-dev && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/OpenFOAM
+RUN download() { \
+        url="$1"; file="$2"; \
+        for attempt in 1 2 3 4 5; do \
+            curl --fail --location --connect-timeout 30 --speed-limit 1024 --speed-time 60 \
+                --continue-at - --output "$file" "$url" && return 0; \
+            if [ "$attempt" = 5 ]; then return 1; fi; \
+            sleep 5; \
+        done; \
+    }; \
+    download 'https://sourceforge.net/projects/openfoam/files/v2006/OpenFOAM-v2006.tgz/download?use_mirror=netix' OpenFOAM-v2006.tgz && \
+    echo "${OPENFOAM_MD5}  OpenFOAM-v2006.tgz" | md5sum --check - && \
+    download 'https://sourceforge.net/projects/openfoam/files/v2006/ThirdParty-v2006.tgz/download?use_mirror=netix' ThirdParty-v2006.tgz && \
+    echo "${THIRD_PARTY_MD5}  ThirdParty-v2006.tgz" | md5sum --check - && \
+    tar -xzf OpenFOAM-v2006.tgz && tar -xzf ThirdParty-v2006.tgz && \
+    rm OpenFOAM-v2006.tgz ThirdParty-v2006.tgz
+RUN source /opt/OpenFOAM/OpenFOAM-v2006/etc/bashrc && \
+    /opt/OpenFOAM/OpenFOAM-v2006/Allwmake -j"${OPENFOAM_BUILD_JOBS}"
+
+FROM ubuntu:20.04 AS builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN for attempt in 1 2 3; do \
+        apt-get -o Acquire::Retries=5 update && \
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
+            ca-certificates curl git git-lfs libboost-all-dev libgl1 \
+            libopenmpi-dev openmpi-bin python3 python3-pip xvfb && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done && git lfs install && rm -rf /var/lib/apt/lists/*
+COPY --from=openfoam-builder /opt/OpenFOAM /opt/OpenFOAM
+
+ENV CONDA_DIR=/opt/conda
+ENV PATH=$CONDA_DIR/bin:$PATH
+ENV PIP_DEFAULT_TIMEOUT=60
+ENV PIP_RETRIES=10
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_NO_DEPS=1
+RUN curl --fail --location --retry 3 \
+      https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+      -o /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p "$CONDA_DIR" && rm /tmp/miniconda.sh
+
+ENV FoamAgent_PATH=/opt/Foam-Agent
+WORKDIR /opt
+COPY . Foam-Agent
+WORKDIR $FoamAgent_PATH
+RUN python3 scripts/verify_target_corpus.py --target esi-v2006
+RUN conda config --add channels conda-forge && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
+    conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
+    # `libcusparse` is the largest package in the locked environment and the
+    # NVIDIA channel can drop long transfers.  Fetch it with curl's resumable
+    # retries before conda resolves the unchanged environment specification.
+    curl --fail --location --retry 10 --retry-delay 5 --connect-timeout 30 \
+        --speed-limit 1024 --speed-time 90 --continue-at - \
+        --output "$CONDA_DIR/pkgs/libcusparse-12.3.1.170-0.tar.bz2" \
+        'https://conda.anaconda.org/nvidia/linux-64/libcusparse-12.3.1.170-0.tar.bz2' && \
+    for attempt in 1 2 3; do \
+        conda env create --file environment.yml --yes && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        conda env remove --name FoamAgent --yes || true; \
+    done && \
+    conda run -n FoamAgent pip install --no-cache-dir --retries 10 --timeout 60 gmsh && \
+    conda clean --all --yes
+
+FROM ubuntu:20.04
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN for attempt in 1 2 3; do \
+        apt-get -o Acquire::Retries=5 update && \
+        DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y \
+            bash ca-certificates libboost-all-dev libgl1 libopenmpi-dev openmpi-bin \
+            python3 xvfb && break; \
+        if [ "$attempt" = 3 ]; then exit 1; fi; \
+        sleep 5; \
+    done && rm -rf /var/lib/apt/lists/*
+COPY --from=openfoam-builder /opt/OpenFOAM /opt/OpenFOAM
+COPY --from=builder /opt/conda /opt/conda
+COPY --from=builder /opt/Foam-Agent /opt/Foam-Agent
+
+ENV CONDA_DIR=/opt/conda
+ENV PATH=$CONDA_DIR/bin:$PATH
+ENV FoamAgent_PATH=/opt/Foam-Agent
+ENV FOAMAGENT_IMAGE_OPENFOAM_TARGET=esi-v2006
+ENV FOAMAGENT_OPENFOAM_TARGET=esi-v2006
+WORKDIR /opt/Foam-Agent
+
+COPY docker/foamagent-entrypoint-esi-v2006.sh /usr/local/bin/foamagent-entrypoint.sh
+RUN chmod +x /usr/local/bin/foamagent-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/foamagent-entrypoint.sh"]
+CMD ["/bin/bash"]

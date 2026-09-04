@@ -54,6 +54,30 @@ python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 
 That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the simulation, and fix errors automatically.
 
+### 4. Run an Existing Case
+
+An existing case can be supplied instead of a natural-language prompt. This mode does not invoke Planner, Meshing, or Input Writer. Instead it enters the workflow's protected existing-case branch (`case_import` → shared local runner with a controlled-import policy → shared reviewer with a deterministic safe-repair policy), preserving the uploaded dictionaries and running a validated, controlled equivalent of its `Allrun`.
+
+```bash
+python foambench_main.py \
+  --output ./output/imported-dam-break \
+  --case_path /path/to/damBreak \
+  --visualize
+```
+
+`--visualize` is optional. When supplied, a successful imported case uses the same read-only PyVista visualization node as a prompt-generated case.
+
+`--case_path` accepts either a case directory or a ZIP archive. If an archive contains multiple cases, select one explicitly:
+
+```bash
+python foambench_main.py \
+  --output ./output/imported-case \
+  --case_path ./tutorials.zip \
+  --case_subdir multiphase/interFoam/laminar/damBreak/damBreak
+```
+
+The output directory contains `original/` (a hashed source copy with read-only files), `work/` (the only directory executed or repaired), and `report/` (the manifest, attempt history, and any diffs). User-provided numeric tokens are never changed automatically. The importer only permits a small set of Foundation v10 utilities/solver commands; custom compilation, dynamic code, ESI cases, and unsafe shell setup are reported as blockers rather than executed. If `Allrun` is absent, Foam-Agent can infer only the minimal `blockMesh`/`checkMesh`/solver plan for a case that already provides enough files.
+
 ## Configuration
 
 All settings live in `src/config.py` with sensible defaults. Every setting can be overridden via environment variables — no need to edit files, especially useful for Docker and CI.
@@ -63,7 +87,7 @@ All settings live in `src/config.py` with sensible defaults. Every setting can b
 | Environment Variable | Purpose | Allowed Values |
 |---|---|---|
 | `FOAMAGENT_MODEL_PROVIDER` | LLM backend | `openai`, `openai-codex`, `anthropic`, `bedrock`, `ollama` |
-| `FOAMAGENT_MODEL_VERSION` | Model identifier | e.g., `gpt-5-mini`, `gpt-5.3-codex`, `claude-opus-4-6` |
+| `FOAMAGENT_MODEL_VERSION` | Model identifier | e.g., `gpt-5-mini`, `gpt-5.6-terra`, `claude-opus-4-6` |
 
 Example:
 ```bash
@@ -193,18 +217,25 @@ Then configure your MCP client:
 
 #### Available MCP Tools
 
-Foam-Agent generates output following **Foundation OpenFOAM v10** conventions by default. If
-`FOAMAGENT_OPENFOAM_FORK=esi` is set, generated input files are translated to ESI OpenFOAM
-(`openfoam.com`) naming and dictionary conventions on a best-effort basis before they are returned.
-The run/review/fix workflow is still primarily validated with Foundation OpenFOAM v10.
+Foundation OpenFOAM v10 is the default native target. Set
+`FOAMAGENT_OPENFOAM_TARGET=esi-v2006` to select the peer native ESI/OpenCFD v2006 target. Each native target uses its own tutorial/FAISS corpus, dictionary conventions, runtime guard, and Docker image.
+
+`FOAMAGENT_OPENFOAM_FORK=esi` is separate from native target selection: it is a legacy, best-effort Foundation-to-ESI translation compatibility path. It does not select v2006 and is never invoked by `FOAMAGENT_OPENFOAM_TARGET=esi-v2006`.
+
+### Native target capability parity
+
+`foundation-v10` and `esi-v2006` are peer native targets. Both support prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, controlled case import, and target-specific Docker delivery. Their solver names and dictionary syntax remain release-native. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
+mode and is not a third native target.
+
+Native tutorial corpora are stored by target under `database/`: Foundation v10 uses `database/foundation-v10/{raw,faiss}`, while ESI/OpenCFD v2006 uses `database/esi-v2006/{raw,faiss}`. The sibling `database/script/` directory contains the parsers and FAISS builders shared by both corpora.
 
 | Tool | Description |
 |------|-------------|
-| `plan` | Analyze requirements and plan simulation structure using Foundation v10 references |
-| `input_writer` | Generate OpenFOAM configuration files; optionally translate generated files when `FOAMAGENT_OPENFOAM_FORK=esi` |
-| `run` | Execute Allrun script locally with error collection; primarily validated with Foundation OpenFOAM v10 |
-| `review` | Analyze simulation errors and suggest fixes via LLM using Foundation v10 references |
-| `apply_fixes` | Rewrite OpenFOAM files based on review analysis; ESI cases remain best-effort |
+| `plan` | Analyze requirements and plan simulation structure using the selected native target's references |
+| `input_writer` | Generate OpenFOAM configuration files using the selected native conventions; legacy translation is available only through `FOAMAGENT_OPENFOAM_FORK=esi` |
+| `run` | Execute Allrun locally with error collection and validate the selected native runtime |
+| `review` | Analyze simulation errors and suggest fixes using the selected native target's references |
+| `apply_fixes` | Rewrite OpenFOAM files according to the selected native conventions |
 | `visualization` | Generate PyVista visualization of simulation results |
 
 #### Claude Code Skill
@@ -229,7 +260,7 @@ If you have a ChatGPT/Codex subscription, you can authenticate via OAuth instead
 ```bash
 docker run -it \
   -e FOAMAGENT_MODEL_PROVIDER=openai-codex \
-  -e FOAMAGENT_MODEL_VERSION=gpt-5.3-codex \
+  -e FOAMAGENT_MODEL_VERSION=gpt-5.6-terra \
   -v ~/.codex/auth.json:/root/.codex/auth.json:ro \
   -p 7860:7860 \
   leoyue123/foamagent
@@ -251,7 +282,7 @@ conda env create -n FoamAgent -f environment.yml
 conda activate FoamAgent
 ```
 
-You also need **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) installed and sourced for the default, fully validated runtime path. ESI OpenFOAM (`openfoam.com`) file generation is available as best-effort translation by setting `FOAMAGENT_OPENFOAM_FORK=esi`, but ESI execution and repair loops should be verified per case. Follow the [official Foundation v10 installation guide](https://openfoam.org/version/10/) and verify with:
+For the default native target, install and source **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)). For native ESI/OpenCFD v2006, install and source its matching v2006 runtime and select `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` as described below. `FOAMAGENT_OPENFOAM_FORK=esi` remains the separate best-effort translation mode. Follow the [official Foundation v10 installation guide](https://openfoam.org/version/10/) for the default path and verify with:
 
 ```bash
 echo $WM_PROJECT_DIR   # should print e.g. /opt/openfoam10
@@ -263,29 +294,65 @@ Then run:
 python foambench_main.py --output ./output --prompt_path ./user_requirement.txt
 ```
 
+### Native ESI/OpenCFD v2006
+
+Build the isolated ESI v2006 corpus from an ESI v2006 installation, then select the target explicitly. Existing configurations remain unchanged unless this target is supplied.
+
+```bash
+# Maintainers: rebuild the versioned v2006 corpus from a sourced ESI/OpenCFD
+# v2006 installation. Regular users receive this corpus through Git LFS.
+python scripts/build_target_corpus.py --openfoam-path "$WM_PROJECT_DIR" --force
+# If a packaged v2006 runtime omits tutorials, point at tutorials extracted
+# from the matching official OpenFOAM-v2006 source archive:
+#   --tutorials-path /path/to/OpenFOAM-v2006/tutorials
+
+# Users: clone with Git LFS, then run the selected native target.
+git lfs pull
+python foambench_main.py --openfoam_target esi-v2006 \
+  --openfoam_path "$WM_PROJECT_DIR" \
+  --output ./output/esi-v2006 --prompt_path ./user_requirement.txt
+```
+
+`WM_PROJECT_VERSION` must report `v2006` (or `2006`) at execution time. The corpus builder's OpenAI index requires `OPENAI_API_KEY`; use
+`FOAMAGENT_ESI_V2006_DATABASE_PATH` only when the v2006 corpus lives outside the default `database/esi-v2006/` directory. Native HPC jobs additionally require `FOAMAGENT_HPC_OPENFOAM_BASHRC` to point to the trusted v2006 `etc/bashrc` on the compute nodes.
+
 ### Building the Docker Image from Source
 
 ```bash
 git clone https://github.com/csml-rpi/Foam-Agent.git
 cd Foam-Agent
-docker build -f docker/Dockerfile -t foamagent:latest .
+python scripts/build_docker_image.py
 docker run -it \
   -e OPENAI_API_KEY=your-key-here \
   -p 7860:7860 \
-  foamagent:latest
+  foamagent:foundation-v10
+```
+
+The ESI v2006 image requires the versioned `database/esi-v2006/` corpus in the build context. Its Docker build validates that all Git LFS assets are hydrated.
+
+```bash
+python scripts/build_docker_image.py --openfoam-target esi-v2006
+docker run -it foamagent:esi-v2006
+```
+
+After either image is built, run the target-runtime smoke test (it validates the sourced version and `blockMesh`, but does not run a solver):
+
+```bash
+bash scripts/verify_target_docker.sh foundation-v10
+bash scripts/verify_target_docker.sh esi-v2006
 ```
 
 ## Troubleshooting
 
 | Problem | Solution |
 |---|---|
-| OpenFOAM environment not found | Ensure the intended OpenFOAM bashrc is sourced. The default validated path is Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)); ESI OpenFOAM requires `FOAMAGENT_OPENFOAM_FORK=esi` and per-case verification |
-| Database files missing | Ensure the full repo is cloned including `database/`. Docker image has these pre-built |
+| OpenFOAM environment not found | Ensure the intended OpenFOAM bashrc is sourced. The default path is Foundation v10; `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` requires an ESI v2006 environment at runtime |
+| Database files missing | Ensure the full repo is cloned including `database/`. Native ESI also needs `database/esi-v2006/` built from v2006 tutorials |
 | Missing dependencies | `conda env update -n FoamAgent -f environment.yml --prune` |
 | API key errors | Ensure the appropriate key is set (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) |
 | MCP connection errors | Verify the container is running and port 7860 is accessible |
 
-> **OpenFOAM version:** Foam-Agent targets **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) by default. With `FOAMAGENT_OPENFOAM_FORK=esi`, generated files are translated to ESI OpenFOAM ([openfoam.com](https://openfoam.com), e.g., v2312, v2406, v2512) conventions on a best-effort basis. The Docker image includes Foundation OpenFOAM v10 pre-installed.
+> **OpenFOAM version:** Foam-Agent targets **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) by default. `FOAMAGENT_OPENFOAM_FORK=esi` retains the legacy best-effort ESI translation path. `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` selects the separate native ESI/OpenCFD v2006 path. Build `foamagent:foundation-v10` or `foamagent:esi-v2006` for the matching runtime; one image cannot switch OpenFOAM distributions at launch.
 
 ## Community
 
@@ -307,4 +374,3 @@ If you use Foam-Agent in your research, please cite our paper:
 }
 
 ```
-

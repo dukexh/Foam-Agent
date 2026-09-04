@@ -29,6 +29,7 @@ from services.visualization import (
     run_pyvista_script
 )
 from config import Config
+from openfoam_target import database_path_for_config
 
 
 def main():
@@ -60,7 +61,8 @@ def main():
         print("-" * 40)
         
         # Load case statistics
-        case_stats_path = os.path.join(config.database_path, "raw", "openfoam_case_stats.json")
+        corpus_path = database_path_for_config(config)
+        case_stats_path = os.path.join(corpus_path, "raw", "openfoam_case_stats.json")
         with open(case_stats_path, 'r') as f:
             case_stats = json.load(f)
         
@@ -123,7 +125,7 @@ def main():
             case_solver=plan_data["case_solver"],
             case_info=case_info_str,
             allrun_reference=allrun_reference,
-            database_path=str(config.database_path),
+            database_path=str(corpus_path),
             searchdocs=config.searchdocs
         )
         
@@ -250,4 +252,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-

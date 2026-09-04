@@ -12,6 +12,7 @@ from services.run_hpc import (
     create_slurm_script,
 )
 from logger import log_review
+from openfoam_target import runtime_target_for_config
 
 
 def hpc_runner_node(state):
@@ -22,6 +23,7 @@ def hpc_runner_node(state):
     """
     config = state["config"]
     case_dir = state["case_dir"]
+    llm_service = state.get("llm_service")
     allrun_file_path = os.path.join(case_dir, "Allrun")
     max_loop = config.max_loop
     current_attempt = 0
@@ -38,7 +40,11 @@ def hpc_runner_node(state):
     
     # Extract cluster information using service
     print("Extracting cluster information from user requirement...")
-    cluster_info = extract_cluster_info_from_requirement(state["user_requirement"], case_dir)
+    cluster_info = extract_cluster_info_from_requirement(
+        state["user_requirement"],
+        case_dir,
+        llm_service=llm_service,
+    )
     print(f"<cluster_info>{cluster_info}</cluster_info>")
     
     # Submit the job with retry logic
@@ -49,7 +55,13 @@ def hpc_runner_node(state):
         # Create SLURM script
         if current_attempt == 1:
             print("Creating initial SLURM script...")
-            script_path = create_slurm_script(case_dir, cluster_info)
+            script_path = create_slurm_script(
+                case_dir,
+                cluster_info,
+                llm_service=llm_service,
+                openfoam_target=runtime_target_for_config(config),
+                openfoam_bashrc=getattr(config, "hpc_openfoam_bashrc", ""),
+            )
         else:
             print(f"Regenerating SLURM script based on previous error...")
             try:
@@ -58,7 +70,15 @@ def hpc_runner_node(state):
             except Exception:
                 prev = ""
             # Use service helper for regeneration
-            script_path = create_slurm_script_with_error_context(case_dir, cluster_info, last_error_msg, prev)
+            script_path = create_slurm_script_with_error_context(
+                case_dir,
+                cluster_info,
+                last_error_msg,
+                prev,
+                llm_service=llm_service,
+                openfoam_target=runtime_target_for_config(config),
+                openfoam_bashrc=getattr(config, "hpc_openfoam_bashrc", ""),
+            )
         
         print(f"SLURM script created at: {script_path}")
         

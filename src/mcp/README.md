@@ -2,7 +2,7 @@
 
 Expose OpenFOAM CFD simulation as tools for any AI coding assistant via [MCP (Model Context Protocol)](https://modelcontextprotocol.io/).
 
-> **OpenFOAM version:** This server targets **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) by default. If `FOAMAGENT_OPENFOAM_FORK=esi` is set, generated input files are translated to ESI OpenFOAM ([openfoam.com](https://openfoam.com), e.g., v2312, v2406, v2512) naming and dictionary conventions on a best-effort basis. The run/review/fix workflow is still primarily validated with Foundation OpenFOAM v10.
+> **OpenFOAM version:** This server targets **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) by default. `FOAMAGENT_OPENFOAM_FORK=esi` remains the legacy best-effort translation path for generated files. Set `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` to use the supported native ESI/OpenCFD v2006 target with its isolated corpus, native conventions, and target-specific runtime checks. Native v2006 requires a matching runtime and corpus.
 
 ## Quick Start
 
@@ -70,17 +70,18 @@ export ANTHROPIC_API_KEY=sk-ant-...                # API key for your provider
 
 ## Available MCP Tools
 
-Foam-Agent generates output following **Foundation OpenFOAM v10** conventions by default. If
-`FOAMAGENT_OPENFOAM_FORK=esi` is set, generated input files are translated to ESI OpenFOAM
-conventions on a best-effort basis before they are returned.
+Foam-Agent generates output following **Foundation OpenFOAM v10** conventions by default.
+Native ESI/OpenCFD v2006 is selected with `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` and uses
+the isolated v2006 corpus and native conventions. The legacy
+`FOAMAGENT_OPENFOAM_FORK=esi` setting remains a separate best-effort translation path.
 
 | Tool | Description |
 |------|-------------|
-| `plan` | Analyze user requirements and plan simulation structure (solver, domain, subtasks) using Foundation v10 references |
-| `input_writer` | Generate OpenFOAM configuration files; optionally translate generated files when `FOAMAGENT_OPENFOAM_FORK=esi` |
-| `run` | Execute Allrun script locally with error collection; primarily validated with Foundation OpenFOAM v10 |
-| `review` | Analyze simulation errors and suggest fixes via LLM using Foundation v10 references |
-| `apply_fixes` | Rewrite OpenFOAM files based on review analysis; ESI cases remain best-effort |
+| `plan` | Analyze requirements and plan a case using references for the active OpenFOAM target |
+| `input_writer` | Generate OpenFOAM configuration files using the active target; legacy `fork=esi` translation remains best-effort |
+| `run` | Execute the local case with target-specific runtime selection and error collection |
+| `review` | Analyze simulation errors using references for the active OpenFOAM target |
+| `apply_fixes` | Rewrite OpenFOAM files using the active target convention |
 | `visualization` | Generate PyVista visualization of simulation results |
 
 ## Typical Workflow
@@ -99,7 +100,7 @@ The assistant will call the tools in sequence:
 ## Prerequisites
 
 - **Python 3.10+** with dependencies installed
-- **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) installed and available in PATH for the default, fully validated runtime path. ESI OpenFOAM (`openfoam.com`) generation is available as best-effort translation with `FOAMAGENT_OPENFOAM_FORK=esi`, but execution and repair loops should be verified per case.
+- **Foundation OpenFOAM v10** ([openfoam.org](https://openfoam.org)) installed and available in PATH for the default runtime path, or a matching **ESI/OpenCFD v2006** runtime when `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` is selected.
 - An LLM API key (OpenAI, Anthropic, or local via Ollama)
 
 ## Architecture
@@ -123,6 +124,9 @@ OpenFOAM + LLM Services
 | `FOAMAGENT_EMBEDDING_PROVIDER` | Embedding backend | `huggingface` |
 | `FOAMAGENT_EMBEDDING_MODEL` | Embedding model | `Qwen/Qwen3-Embedding-0.6B` |
 | `FOAMAGENT_OPENFOAM_FORK` | OpenFOAM target fork for generated files: `foundation` or `esi` | `foundation` |
+| `FOAMAGENT_OPENFOAM_TARGET` | Explicit native target: `foundation-v10` or `esi-v2006`; v2006 bypasses legacy ESI translation | — |
+| `FOAMAGENT_ESI_V2006_DATABASE_PATH` | Optional isolated v2006 tutorial/FAISS corpus root | `database/esi-v2006` |
+| `FOAMAGENT_HPC_OPENFOAM_BASHRC` | Trusted v2006 `etc/bashrc` sourced in native HPC job scripts | — |
 | `OPENAI_API_KEY` | OpenAI API key | — |
 | `ANTHROPIC_API_KEY` | Anthropic API key | — |
 
@@ -130,13 +134,16 @@ OpenFOAM + LLM Services
 
 **Import errors:** Ensure you ran `pip install -e .` from the repo root.
 
-**Database errors:** The FAISS indices ship pre-built in `database/faiss/`. If missing, rebuild with:
+**Database errors:** Target-scoped FAISS indices ship pre-built in
+`database/foundation-v10/` and `database/esi-v2006/`. If a target corpus is
+missing, rebuild the selected corpus with:
 ```bash
-python init_database.py --openfoam_path $WM_PROJECT_DIR --force
+python init_database.py --openfoam_path $WM_PROJECT_DIR --openfoam_target foundation-v10 --force
 ```
 
-**OpenFOAM not found:** The default validated runtime path requires Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)). If using ESI OpenFOAM, set `FOAMAGENT_OPENFOAM_FORK=esi` and verify the generated case against your local ESI installation. Install Foundation v10 or use the Docker image:
+**OpenFOAM not found:** The default validated runtime path requires Foundation OpenFOAM v10 ([openfoam.org](https://openfoam.org)). Legacy generic ESI uses `FOAMAGENT_OPENFOAM_FORK=esi`; native v2006 uses `FOAMAGENT_OPENFOAM_TARGET=esi-v2006`, a v2006 target corpus, and `WM_PROJECT_VERSION=v2006`. For a native HPC run set `FOAMAGENT_HPC_OPENFOAM_BASHRC` to the compute-node v2006 `etc/bashrc`. Build the matching image with:
 ```bash
-docker build -f docker/Dockerfile -t foamagent:latest .
-docker run -it -p 7860:7860 foamagent:latest foamagent-mcp --transport http
+python scripts/build_docker_image.py
+python scripts/build_docker_image.py --openfoam-target esi-v2006
+docker run -it -p 7860:7860 foamagent:foundation-v10 foamagent-mcp --transport http
 ```

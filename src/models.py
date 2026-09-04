@@ -1,5 +1,8 @@
+from dataclasses import asdict, dataclass, field
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
+
+from openfoam_target import ESI_V2006
 
 
 class CreateCaseIn(BaseModel):
@@ -119,5 +122,59 @@ class VisualizationIn(BaseModel):
 class VisualizationOut(BaseModel):
     job_id: Optional[str]
     artifacts: List[str]
+
+
+class CaseImportError(ValueError):
+    """Raised when a case cannot safely enter controlled import mode."""
+
+
+@dataclass(frozen=True)
+class ExecutionStep:
+    """One validated OpenFOAM command in a controlled execution plan."""
+
+    command: str
+    args: tuple[str, ...] = ()
+    parallel: bool = False
+    origin: str = "user_allrun"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "args": list(self.args),
+            "parallel": self.parallel,
+            "origin": self.origin,
+        }
+
+
+@dataclass
+class CaseManifest:
+    """Selected existing case and its data-only execution plan."""
+
+    source: str
+    case_root: str
+    output_root: str
+    platform: str
+    version: Optional[str]
+    application: str
+    allrun_provided: bool
+    mesh_state: str
+    execution_plan: list[ExecutionStep] = field(default_factory=list)
+    detected_libraries: list[str] = field(default_factory=list)
+    blocking_issues: list[str] = field(default_factory=list)
+    original_hashes: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def supported(self) -> bool:
+        return not self.blocking_issues and self.platform in {
+            "foundation-v10",
+            "foundation-v10-compatible",
+            ESI_V2006,
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["execution_plan"] = [step.to_dict() for step in self.execution_plan]
+        result["supported"] = self.supported
+        return result
 
 

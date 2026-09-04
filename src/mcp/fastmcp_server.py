@@ -7,14 +7,13 @@ exposing OpenFOAM simulation capabilities through clean, well-typed interfaces.
 import asyncio
 import os
 import json
-from typing import Dict, List, Optional, Any
+from typing import Dict, List
 
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
 
 # Import existing services
 import sys
-import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.plan import (
@@ -28,13 +27,16 @@ from services.run_local import run_allrun_and_collect_errors
 from utils import FoamPydantic, read_case_foamfiles, scan_case_directory
 from services.review import review_error_logs
 from translation.esi_translator import convert_case_to_esi_if_needed
-from services.visualization import (
-    ensure_foam_file,
-    generate_pyvista_script,
-    run_pyvista_script,
-    fix_pyvista_script
-)
+from services.visualization import visualize_case
+from services.output_safety import prepare_output_directory
 from config import Config
+from openfoam_target import (
+    database_path_for_config,
+    generation_convention,
+    require_target_corpus,
+    runtime_target_for_config,
+    uses_legacy_esi_translation,
+)
 
 
 # Global configuration
@@ -52,9 +54,16 @@ By managing the full pipeline—from meshing and case setup to execution and pos
 IMPORTANT: Foam-Agent generates cases using **Foundation OpenFOAM v10** conventions by default. If
 `FOAMAGENT_OPENFOAM_FORK=esi` is set, generated input files are translated to ESI OpenFOAM
 (openfoam.com) naming and dictionary conventions on a best-effort basis before they are returned.
+This legacy fork setting is not the native v2006 target.
 
-The run/review/fix workflow is still primarily validated with Foundation OpenFOAM v10. ESI execution
-support is experimental and should be verified for each case.
+Native ESI/OpenCFD v2006 is supported by setting
+`FOAMAGENT_OPENFOAM_TARGET=esi-v2006`. In that mode, planning and generation use the isolated
+v2006 corpus and native conventions, local execution sources and validates the v2006 runtime,
+and review/fix uses the same target convention. The native target bypasses the legacy translator.
+It requires a matching ESI v2006 runtime and target corpus.
+
+Existing-case import is currently exposed through the CLI/StateGraph workflow, not as a separate
+FastMCP tool. Imported cases use the controlled local execution path and do not invoke LLM repair.
 """
 )
 
@@ -89,9 +98,10 @@ async def plan(
     """
     try:
         await ctx.info("Planning simulation structure from user requirements")
+        require_target_corpus(global_config)
         
         # Load case statistics, available domains, categories, and solvers
-        case_stats_path = os.path.join(global_config.database_path, "raw", "openfoam_case_stats.json")
+        case_stats_path = database_path_for_config(global_config) / "raw" / "openfoam_case_stats.json"
         with open(case_stats_path, 'r') as f:
             case_stats = json.load(f)
         
@@ -101,6 +111,7 @@ async def plan(
             case_stats=case_stats,
             case_dir="",  # Will be resolved later
             searchdocs=global_config.searchdocs,
+            config=global_config,
         )
         
         await ctx.info(f"Generated {len(plan_data['subtasks'])} subtasks")
@@ -133,6 +144,10 @@ class GenerateFilesRequest(BaseModel):
     case_solver: str = Field(description="OpenFOAM solver to use")
     case_domain: str = Field(description="Simulation domain")
     case_category: str = Field(description="Case category")
+    overwrite_output: bool = Field(
+        default=False,
+        description="Allow replacing an existing Foam-Agent-owned output directory.",
+    )
 
 
 class GenerateFilesResponse(BaseModel):
@@ -150,12 +165,13 @@ async def input_writer(
     """Generate OpenFOAM input files based on subtasks and requirements.
 
     This function creates all necessary OpenFOAM input files (system/, constant/, 0/).
-    It generates files using Foundation v10 conventions by default. If
-    FOAMAGENT_OPENFOAM_FORK=esi is set, it applies a best-effort post-generation
-    translation to ESI naming and dictionary conventions before returning files.
+    It generates Foundation v10 files by default. Explicit native ESI v2006 uses
+    its own corpus and conventions; the separate FOAMAGENT_OPENFOAM_FORK=esi
+    compatibility mode still applies best-effort post-generation translation.
     """
     try:
         await ctx.info(f"Generating OpenFOAM files for case: {request.case_name}")
+        require_target_corpus(global_config)
 
         # Resolve case directory
         case_dir = resolve_case_dir(
@@ -163,11 +179,12 @@ async def input_writer(
             case_dir="",
             run_times=global_config.run_times
         )
+        prepare_output_directory(case_dir, overwrite=request.overwrite_output)
 
         await ctx.info(f"Case directory: {case_dir}")
 
         # Load case statistics and retrieve references
-        case_stats_path = os.path.join(global_config.database_path, "raw", "openfoam_case_stats.json")
+        case_stats_path = database_path_for_config(global_config) / "raw" / "openfoam_case_stats.json"
         with open(case_stats_path, 'r') as f:
             case_stats = json.load(f)
 
@@ -188,6 +205,7 @@ async def input_writer(
             case_domain=case_info["case_domain"],
             case_category=case_info["case_category"],
             searchdocs=global_config.searchdocs,
+            config=global_config,
         )
 
         # Convert subtasks format from {file, folder} to {file_name, folder_name}
@@ -236,10 +254,12 @@ async def input_writer(
             case_solver=request.case_solver,
             case_info=str(case_info),
             allrun_reference=allrun_reference,
-            database_path=str(global_config.database_path),
+            database_path=str(database_path_for_config(global_config)),
             searchdocs=global_config.searchdocs,
             similar_case_advice=similar_case_advice,
             progress_callback=progress_callback,
+            openfoam_fork=generation_convention(global_config),
+            config=global_config,
         )
 
         await ctx.info(f"result: {result}")
@@ -250,7 +270,8 @@ async def input_writer(
             raise ValueError("No foamfiles returned from initial_write")
 
         # Convert to ESI if needed
-        convert_case_to_esi_if_needed(case_dir, global_config)
+        if uses_legacy_esi_translation(global_config):
+            convert_case_to_esi_if_needed(case_dir, global_config)
         
         # Rescan the directory and foam files to reflect any translations
         dir_structure = scan_case_directory(case_dir)
@@ -299,10 +320,10 @@ async def run(
 ) -> RunSimulationResponse:
     """Run the OpenFOAM simulation locally.
 
-    This function executes the Allrun script and collects any errors.
-    It is primarily validated with Foundation OpenFOAM v10 (openfoam.org). Cases translated
-    with FOAMAGENT_OPENFOAM_FORK=esi may run on ESI OpenFOAM, but that path is experimental
-    and depends on the active OpenFOAM environment.
+    This function executes the Allrun script and collects any errors. Foundation
+    v10 is the default runtime. An explicit ESI v2006 target sources and checks
+    its native runtime; legacy FOAMAGENT_OPENFOAM_FORK=esi remains a separately
+    translated compatibility path.
     """
     try:
         await ctx.info(f"Running simulation in directory: {request.case_dir}")
@@ -315,7 +336,8 @@ async def run(
         error_logs = run_allrun_and_collect_errors(
             case_dir=request.case_dir,
             timeout=request.timeout,
-            max_retries=3
+            max_retries=3,
+            openfoam_target=runtime_target_for_config(global_config),
         )
         
         # Convert error logs to strings if they're dictionaries
@@ -379,18 +401,20 @@ async def review(
     """Review simulation errors and suggest improvements.
 
     This function analyzes simulation errors and provides suggestions for fixes.
-    The RAG references and fix reasoning are based on Foundation OpenFOAM v10 tutorials.
-    ESI-translated cases can be reviewed, but suggested fixes should be treated as best-effort.
+    It uses Foundation v10 references by default, or an isolated ESI v2006 corpus
+    when that native target is selected. Legacy translated ESI cases remain
+    best-effort.
     """
     try:
         await ctx.info(f"Reviewing errors for case directory: {request.case_dir}")
+        require_target_corpus(global_config)
         
         # Validate case directory exists
         if not os.path.exists(request.case_dir):
             raise ValueError(f"Case directory does not exist: {request.case_dir}")
         
         # Load case statistics
-        case_stats_path = os.path.join(global_config.database_path, "raw", "openfoam_case_stats.json")
+        case_stats_path = database_path_for_config(global_config) / "raw" / "openfoam_case_stats.json"
         with open(case_stats_path, 'r') as f:
             case_stats = json.load(f)
         
@@ -411,6 +435,7 @@ async def review(
             case_domain=case_info["case_domain"],
             case_category=case_info["case_category"],
             searchdocs=global_config.searchdocs,
+            config=global_config,
         )
         
         # Read current foamfiles from case directory for review context
@@ -425,7 +450,8 @@ async def review(
             foamfiles=foamfiles,
             error_logs=request.errors,
             user_requirement=request.user_requirement,
-            history_text=None
+            history_text=None,
+            openfoam_target=generation_convention(global_config),
         )
         
         await ctx.info(f"Review completed, found {len(request.errors)} error(s)")
@@ -467,8 +493,9 @@ async def apply_fixes(
 
     This tool rewrites OpenFOAM files to fix errors identified during review.
     It must be called after the 'review' tool has provided analysis.
-    Fix generation targets Foundation OpenFOAM v10 conventions by default. If the case is
-    later translated with FOAMAGENT_OPENFOAM_FORK=esi, those fixes are best-effort for ESI.
+    Fix generation follows the active target convention: Foundation v10 by default,
+    native ESI v2006 when `FOAMAGENT_OPENFOAM_TARGET=esi-v2006` is selected, and
+    best-effort translation when the legacy `FOAMAGENT_OPENFOAM_FORK=esi` mode is used.
     
     The tool directly calls rewrite_files which handles:
     - Reading current foamfiles and directory structure from case_dir
@@ -500,6 +527,7 @@ async def apply_fixes(
     """
     try:
         await ctx.info(f"Applying fixes for case directory: {request.case_dir}")
+        require_target_corpus(global_config)
         
         # Validate case directory exists
         if not os.path.exists(request.case_dir):
@@ -522,7 +550,8 @@ async def apply_fixes(
             error_logs=request.error_logs,
             review_analysis=request.review_analysis,
             rewrite_plan=None,
-            user_requirement=request.user_requirement
+            user_requirement=request.user_requirement,
+            openfoam_fork=generation_convention(global_config),
             # foamfiles and dir_structure will be read automatically if None
         )
         
@@ -571,9 +600,10 @@ async def visualization(
 ) -> VisualizationResponse:
     """Generate visualization for the simulation results.
 
-    This function creates visualization artifacts using PyVista.
-    It is primarily validated with Foundation OpenFOAM v10 outputs; ESI outputs should be
-    verified per case.
+    This function creates visualization artifacts using PyVista for the active
+    OpenFOAM target's output. Runtime and corpus selection are handled by the
+    preceding workflow tools; native ESI v2006 uses the same target selection as
+    planning, generation, execution, and review.
     """
     try:
         await ctx.info(f"Generating visualization for case directory: {request.case_dir}")
@@ -582,27 +612,18 @@ async def visualization(
         if not os.path.exists(request.case_dir):
             raise ValueError(f"Case directory does not exist: {request.case_dir}")
         
-        # Ensure foam file exists
-        foam_file = ensure_foam_file(request.case_dir)
-        
-        # Generate visualization script
-        script = generate_pyvista_script(
-            case_dir=request.case_dir,
-            foam_file=foam_file,
-            user_requirement=request.quantity,
-            previous_errors=[]
+        result = await asyncio.to_thread(
+            visualize_case,
+            request.case_dir,
+            request.quantity,
+            max_loop=max(1, min(global_config.max_loop, 2)),
+            timeout_s=max(1, min(global_config.max_time_limit, 180)),
         )
-        
-        # Run visualization script
-        ok, img, errs = run_pyvista_script(request.case_dir, script)
-        
-        if ok and img:
-            artifacts = [img]
-        else:
-            # Try to fix the script
-            fixed = fix_pyvista_script(foam_file, script, errs)
-            ok2, img2, errs2 = run_pyvista_script(request.case_dir, fixed)
-            artifacts = [img2] if ok2 and img2 else []
+        visualization_result = result["pyvista_visualization"]
+        if not visualization_result["success"]:
+            raise RuntimeError(visualization_result["error"])
+        artifacts = result["plot_outputs"]
+        script = visualization_result["script"]
         
         await ctx.info(f"Generated {len(artifacts)} visualization artifact(s)")
         
