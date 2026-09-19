@@ -1,7 +1,5 @@
-"""Thin LangGraph adapter for planning and output-directory preparation."""
-
 from utils import save_file
-from services.plan import generate_simulation_plan
+from services.plan import generate_simulation_plan, plan_imported_case
 from services.output_safety import (
     OutputDirectorySafetyError,
     prepare_output_directory,
@@ -16,8 +14,27 @@ def planner_node(state):
     Planner node: Parse the user requirement to a standard case description,
     finds a similar reference case from the FAISS databases, and splits the work into subtasks.
     Updates state with:
-      - case_dir, tutorial, case_name, subtasks.
+      - case_dir, case_name, subtasks.
     """
+    if state.get("case_origin") == "imported":
+        print("<planner mode=\"existing_case\">")
+        result = plan_imported_case(state)
+        if result.get("workflow_status") == "running":
+            if result.get("requires_meshing"):
+                if state.get("custom_mesh_path"):
+                    result["mesh_type"] = "custom_mesh"
+                else:
+                    mesh_choice = llm_requires_custom_mesh({**state, **result})
+                    result["mesh_type"] = (
+                        "gmsh_mesh" if mesh_choice == 2 else "standard_mesh"
+                    )
+            result["requires_hpc"] = llm_requires_hpc({**state, **result})
+            result["requires_visualization"] = llm_requires_visualization(
+                {**state, **result}
+            )
+        print("</planner>")
+        return result
+
     config = state["config"]
     user_requirement = state["user_requirement"]
 

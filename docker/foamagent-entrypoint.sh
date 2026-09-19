@@ -131,3 +131,4 @@ if [ "$1" = "/bin/bash" ] || [ "$1" = "bash" ] || [ -z "$1" ]; then
 else
     exec "$@"
 fi
+

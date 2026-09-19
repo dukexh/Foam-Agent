@@ -1,5 +1,3 @@
-"""Contain untrusted generated file names within an OpenFOAM case root."""
-
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath

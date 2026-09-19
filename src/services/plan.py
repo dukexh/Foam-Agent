@@ -5,7 +5,8 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from utils import retrieve_faiss, parse_directory_structure
 from config import Config
-from openfoam_target import generation_convention
+from openfoam_target import generation_convention, configured_openfoam_target
+from models import ExistingCasePlan
 from . import global_llm_service
 from .case_paths import CasePathSafetyError, safe_case_relative_path
 
@@ -154,143 +155,8 @@ class SimilarCaseAdviceModel(BaseModel):
     advice: str = Field(description="one-sentence advice to include in prompts")
 
 
-_STRUCTURE_RECALL_FLOOR = 200
-_STRUCTURE_RECALL_MULTIPLIER = 20
 _DETAIL_RECALL_FLOOR = 50
 _DETAIL_RECALL_MULTIPLIER = 5
-_REFERENCE_FILE_CONTENT_LIMIT = 20_000
-_REFERENCE_TOTAL_CONTENT_LIMIT = 200_000
-_REFERENCE_FILE_PATTERN = re.compile(
-    r"(<file_begin>\s*file name:\s*[^\n<]+\s*\n<file_content>)(.*?)(</file_content>\s*</file_end>)",
-    re.DOTALL | re.IGNORECASE,
-)
-def _normalise_metadata(value: Any) -> str:
-    return str(value or "").strip().casefold()
-
-
-def _normalise_structure(value: Any) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
-
-
-def _retrieval_tokens(value: Any) -> List[str]:
-    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(value or ""))
-    return [
-        token.casefold()
-        for token in re.findall(r"[A-Za-z0-9]+", text)
-        if len(token) >= 3
-    ]
-
-
-def _case_name_overlap(item: Dict[str, Any], query_text: str) -> float:
-    name_tokens = set(_retrieval_tokens(item.get("case_name")))
-    if not name_tokens:
-        return 0.0
-    query_tokens = _retrieval_tokens(query_text)
-    return sum(query_tokens.count(token) for token in name_tokens) / len(name_tokens)
-
-
-def _score_value(item: Dict[str, Any]) -> float:
-    score = item.get("score")
-    if score is None:
-        return float("inf")
-    try:
-        return float(score)
-    except (TypeError, ValueError):
-        return float("inf")
-
-
-def _metadata_identity(item: Dict[str, Any]) -> tuple[str, str, str, str]:
-    return tuple(
-        _normalise_metadata(item.get(key))
-        for key in ("case_name", "case_domain", "case_category", "case_solver")
-    )
-
-
-def _extract_directory_structure(item: Dict[str, Any]) -> str:
-    structure = item.get("dir_structure")
-    if structure and _normalise_metadata(structure) != "unknown":
-        return str(structure).strip()
-
-    full_content = str(item.get("full_content") or "")
-    match = re.search(
-        r"<directory_structure>(.*?)</directory_structure>",
-        full_content,
-        re.DOTALL | re.IGNORECASE,
-    )
-    return match.group(1).strip() if match else ""
-
-
-def _allocate_content_budgets(target_lengths: List[int], available: int) -> List[int]:
-    """Distribute a total character budget without penalising small files."""
-    if not target_lengths:
-        return []
-    if available <= 0:
-        return [0] * len(target_lengths)
-    if sum(target_lengths) <= available:
-        return target_lengths
-
-    budgets = [0] * len(target_lengths)
-    remaining = available
-    active = set(range(len(target_lengths)))
-
-    while active:
-        share = remaining // len(active)
-        completed = [idx for idx in active if target_lengths[idx] <= share]
-        if not completed:
-            for offset, idx in enumerate(sorted(active)):
-                budgets[idx] = share + (1 if offset < remaining % len(active) else 0)
-            break
-
-        for idx in completed:
-            budgets[idx] = target_lengths[idx]
-            remaining -= budgets[idx]
-            active.remove(idx)
-
-    return budgets
-
-
-def _crop_file_content(content: str, budget: int) -> str:
-    if len(content) <= budget:
-        return content
-    if budget <= 0:
-        return ""
-
-    marker = f"\n/* [reference content omitted; original_chars={len(content)}] */\n"
-    if budget <= len(marker):
-        return marker[:budget]
-    return content[: budget - len(marker)] + marker
-
-
-def _truncate_large_reference_files(
-    reference: str,
-    per_file_limit: int = _REFERENCE_FILE_CONTENT_LIMIT,
-    total_content_limit: int = _REFERENCE_TOTAL_CONTENT_LIMIT,
-) -> str:
-    """Bound tutorial prompt size while retaining its index, tree, and every file name.
-
-    Tutorial details can contain generated meshes, sampled data, or millions of
-    particle positions.  Those data are useful as files in the directory tree but
-    not as verbatim LLM context.  The limits are content-based and intentionally
-    independent of case names and file names.
-    """
-    matches = list(_REFERENCE_FILE_PATTERN.finditer(reference))
-    if not matches:
-        return reference
-
-    original_lengths = [len(match.group(2)) for match in matches]
-    outside_content_length = len(reference) - sum(original_lengths)
-    available = max(0, total_content_limit - outside_content_length)
-    target_lengths = [min(length, max(0, per_file_limit)) for length in original_lengths]
-    budgets = _allocate_content_budgets(target_lengths, available)
-
-    parts: List[str] = []
-    cursor = 0
-    for match, budget in zip(matches, budgets):
-        parts.append(reference[cursor:match.start(2)])
-        parts.append(_crop_file_content(match.group(2), budget))
-        cursor = match.end(2)
-    parts.append(reference[cursor:])
-    return "".join(parts)
 
 
 def _log_top3(label: str, items: List[Dict[str, Any]]) -> None:
@@ -304,80 +170,14 @@ def _log_top3(label: str, items: List[Dict[str, Any]]) -> None:
 def _rerank_candidates(
     candidates: List[Dict[str, Any]],
     case_solver: str,
-    query_text: str = "",
 ) -> List[Dict[str, Any]]:
     def key(item: Dict[str, Any]) -> tuple:
-        solver_match = int(
-            _normalise_metadata(item.get("case_solver"))
-            == _normalise_metadata(case_solver)
-        )
-        return (
-            -solver_match,
-            -_case_name_overlap(item, query_text),
-            _score_value(item),
-        )
+        solver_match = 1 if item.get("case_solver") == case_solver else 0
+        score = item.get("score")
+        score_val = 0.0 if score is None else float(score)
+        return (-solver_match, score_val)
 
     return sorted(candidates, key=key)
-
-
-def _retrieve_matching_details(
-    selected: Dict[str, Any],
-    dir_structure: str,
-    recall_k: int,
-    config: Optional[Config] = None,
-) -> Optional[Dict[str, Any]]:
-    """Fetch details for the exact case selected from the structure index."""
-    detail_query = (
-        "<index>\n"
-        f"case name: {selected.get('case_name')}\n"
-        f"case domain: {selected.get('case_domain')}\n"
-        f"case category: {selected.get('case_category')}\n"
-        f"case solver: {selected.get('case_solver')}\n"
-        "</index>\n"
-        f"<directory_structure>\n{dir_structure}\n</directory_structure>"
-    )
-
-    try:
-        kwargs: Dict[str, Any] = {"topk": recall_k}
-        if config is not None:
-            kwargs["config"] = config
-        candidates = retrieve_faiss(
-            "openfoam_tutorials_details",
-            detail_query,
-            **kwargs,
-        )
-    except ValueError as exc:
-        print(f"Warning: Could not retrieve tutorial details: {exc}")
-        return None
-
-    selected_identity = _metadata_identity(selected)
-    exact_matches = [
-        candidate
-        for candidate in candidates
-        if _metadata_identity(candidate) == selected_identity
-    ]
-    if not exact_matches:
-        print(
-            "Warning: Details index did not return the exact case selected from "
-            "the structure index; skipping tutorial contents."
-        )
-        return None
-
-    target_structure = _normalise_structure(dir_structure)
-    exact_structure_matches = [
-        candidate
-        for candidate in exact_matches
-        if _normalise_structure(_extract_directory_structure(candidate))
-        == target_structure
-    ]
-    if not exact_structure_matches:
-        print(
-            "Warning: Details index returned matching case metadata but not the "
-            "same directory structure; skipping tutorial contents."
-        )
-        return None
-
-    return min(exact_structure_matches, key=_score_value)
 
 
 def _build_advice(
@@ -428,17 +228,12 @@ def retrieve_references(case_name: str,
     print("Retrieval query:\n" + case_info)
 
     requested_docs = max(1, int(searchdocs))
-    recall_k = max(
-        _STRUCTURE_RECALL_FLOOR,
-        requested_docs * _STRUCTURE_RECALL_MULTIPLIER,
-    )
+    recall_k = max(10, int(searchdocs))
     detail_recall_k = max(
         _DETAIL_RECALL_FLOOR,
         requested_docs * _DETAIL_RECALL_MULTIPLIER,
     )
     retrieval_query = case_info
-    if user_requirement.strip():
-        retrieval_query += f"\nuser requirement: {user_requirement.strip()}"
 
     structure_kwargs: Dict[str, Any] = {"topk": recall_k}
     if config is not None:
@@ -450,41 +245,20 @@ def retrieve_references(case_name: str,
     )
     print(f"Retrieved {len(faiss_structure_all)} candidates from FAISS.")
 
-    # Domain and solver are compatibility constraints, not merely semantic hints.
+    # Hard constraint: domain must match; solver match is a ranking preference.
     domain_matched = [
-        candidate
-        for candidate in faiss_structure_all
-        if _normalise_metadata(candidate.get("case_domain"))
-        == _normalise_metadata(case_domain)
+        candidate for candidate in faiss_structure_all
+        if _normalise_metadata(candidate.get("case_domain")) == _normalise_metadata(case_domain)
     ]
-    compatible = [
-        candidate
-        for candidate in domain_matched
-        if _normalise_metadata(candidate.get("case_solver"))
-        == _normalise_metadata(case_solver)
-    ]
-    ranked = _rerank_candidates(compatible, case_solver, retrieval_query)
-    _log_top3("Domain-and-solver-matched structure candidates", ranked)
+    _log_top3("Domain-matched structure candidates", domain_matched)
 
-    if not ranked:
-        print(
-            "No compatible similar case found under "
-            f"domain={case_domain}, solver={case_solver}."
-        )
-        advice_candidates = _rerank_candidates(
-            domain_matched,
-            case_solver,
-            retrieval_query,
-        )
-        advice = _build_advice(
-            user_requirement,
-            case_info,
-            None,
-            advice_candidates or faiss_structure_all,
-            llm_service,
-        )
+    if not domain_matched:
+        print(f"No suitable similar case found under domain={case_domain}.")
+        advice = _build_advice(user_requirement, case_info, None, faiss_structure_all, llm_service)
         return "", "", "", "", advice
 
+    # Rerank by solver match, then semantic score.
+    ranked = _rerank_candidates(domain_matched, case_solver)
     selected = ranked[0]
     dir_structure = _extract_directory_structure(selected)
     if not dir_structure:
@@ -507,7 +281,6 @@ def retrieve_references(case_name: str,
             faiss_detailed = ""
         else:
             faiss_detailed = re.sub(r"\n{3,}", "\n\n", faiss_detailed)
-            faiss_detailed = _truncate_large_reference_files(faiss_detailed)
 
     dir_counts = parse_directory_structure(dir_structure)
     dir_counts_str = ',\n'.join([f"There are {count} files in Directory: {directory}" for directory, count in dir_counts.items()])
@@ -680,3 +453,216 @@ def generate_simulation_plan(
         "subtasks": subtasks,
         "similar_case_advice": advice,
     }
+
+
+DEFAULT_IMPORTED_REQUIREMENT = (
+    "Run the supplied OpenFOAM case while preserving its existing physical definition. "
+    "Diagnose and repair technical problems only when execution requires it."
+)
+
+
+
+def _model_dump(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, dict):
+        return value
+    raise TypeError(f"Expected a structured model response, got {type(value).__name__}")
+
+
+def plan_imported_case(state: dict[str, Any]) -> dict[str, Any]:
+    """Choose graph branches without regenerating an existing case."""
+    # The import snapshot is used only for source selection and initial checks.
+    # Subsequent planning reads current files, not the snapshot's solver/issues.
+    context = dict(state.get("case_context") or {})
+    issues = list(context.get("issues") or [])
+    target = configured_openfoam_target(state.get("config")) or context.get("platform")
+    if target not in {"foundation-v10", "foundation-v10-compatible", "esi-v2006"}:
+        return {
+            "workflow_status": "failed",
+            "requires_meshing": False,
+            "requires_input_writer": False,
+            "termination_reason": "Specify --openfoam_target foundation-v10 or esi-v2006.",
+        }
+
+    manifest = state.get("case_import_manifest")
+    if getattr(manifest, "target_mismatch", False):
+        mismatch_errors = [
+            issue for issue in issues
+            if issue.startswith("Configured target ") and "differs from detected" in issue
+        ]
+        if not mismatch_errors:
+            mismatch_errors = [
+                "Configured OpenFOAM target does not match the detected case platform."
+            ]
+        return {
+            "workflow_status": "failed",
+            "target_mismatch": True,
+            "requires_meshing": False,
+            "requires_input_writer": False,
+            "error_logs": [
+                {"file": "case_import", "error_content": issue}
+                for issue in mismatch_errors
+            ],
+            "termination_reason": "case_target_mismatch",
+        }
+
+    explicit_requirement = bool(state.get("user_requirement_explicit"))
+    if (
+        not explicit_requirement
+        and not state.get("loop_count")
+        and context.get("has_allrun")
+        and not issues
+    ):
+        return {
+            "workflow_status": "running",
+            "requires_meshing": False,
+            "requires_input_writer": False,
+            "termination_reason": None,
+        }
+
+    prompt = (
+        "You are planning work on an existing OpenFOAM case. Return structured routing decisions. "
+        "Set requires_input_writer only when files must be created or changed, and requires_meshing "
+        "only when an external or Gmsh mesh operation is needed. The graph prepares the mesh first, "
+        "then modifies files if needed, then runs the case. A complete case with no requested changes "
+        "must set both flags to false. Preserve existing physical conditions unless explicitly changed. "
+        "If a required physical condition cannot be inferred, return failed and explain the missing information in reason. "
+        "When requires_input_writer is true, target_files must list the files to create or modify and the required changes. "
+        "Explain the requested modifications in reason.\n"
+        f"<user_requirement>{state.get('user_requirement', '')}</user_requirement>\n"
+        f"<dir_structure>{state.get('dir_structure') or {}}</dir_structure>\n"
+        f"<foamfiles>{state.get('foamfiles')}</foamfiles>\n"
+        f"<error_logs>{state.get('error_logs') or []}</error_logs>\n"
+        f"<review_analysis>{state.get('review_analysis') or ''}</review_analysis>\n"
+        f"<custom_mesh_path>{state.get('custom_mesh_path') or ''}</custom_mesh_path>\n"
+        f"<openfoam_target>{target}</openfoam_target>"
+    )
+    llm = state.get("llm_service")
+    response = llm.invoke(
+        prompt,
+        "Plan the minimum work required for this existing case.",
+        pydantic_obj=ExistingCasePlan,
+    )
+    plan = _model_dump(response)
+    status = plan.get("status", "failed")
+    targets = plan.get("target_files") or []
+    if status == "ready" and plan.get("requires_input_writer") and not targets:
+        return {
+            "workflow_status": "failed",
+            "requires_meshing": False,
+            "requires_input_writer": False,
+            "termination_reason": "Planner must specify target_files before requesting file changes.",
+        }
+    return {
+        "workflow_status": "running" if status == "ready" else status,
+        "requires_meshing": bool(plan.get("requires_meshing")),
+        "requires_input_writer": bool(plan.get("requires_input_writer")),
+        "input_writer_mode": "rewrite",
+        "review_analysis": plan.get("reason") or "Apply the requested changes to the existing case.",
+        "rewrite_plan": {"target_files": targets} if targets else None,
+        "termination_reason": None if status == "ready" else plan.get("reason") or status,
+    }
+
+
+def _normalise_metadata(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _normalise_structure(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+
+
+
+
+
+def _score_value(item: Dict[str, Any]) -> float:
+    score = item.get("score")
+    if score is None:
+        return float("inf")
+    try:
+        return float(score)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def _metadata_identity(item: Dict[str, Any]) -> tuple[str, str, str, str]:
+    return tuple(
+        _normalise_metadata(item.get(key))
+        for key in ("case_name", "case_domain", "case_category", "case_solver")
+    )
+
+
+def _extract_directory_structure(item: Dict[str, Any]) -> str:
+    structure = item.get("dir_structure")
+    if structure and _normalise_metadata(structure) != "unknown":
+        return str(structure).strip()
+
+    full_content = str(item.get("full_content") or "")
+    match = re.search(
+        r"<directory_structure>(.*?)</directory_structure>",
+        full_content,
+        re.DOTALL | re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _retrieve_matching_details(
+    selected: Dict[str, Any],
+    dir_structure: str,
+    recall_k: int,
+    config: Optional[Config] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch details for the exact case selected from the structure index."""
+    detail_query = (
+        "<index>\n"
+        f"case name: {selected.get('case_name')}\n"
+        f"case domain: {selected.get('case_domain')}\n"
+        f"case category: {selected.get('case_category')}\n"
+        f"case solver: {selected.get('case_solver')}\n"
+        "</index>\n"
+        f"<directory_structure>\n{dir_structure}\n</directory_structure>"
+    )
+
+    try:
+        kwargs: Dict[str, Any] = {"topk": recall_k}
+        if config is not None:
+            kwargs["config"] = config
+        candidates = retrieve_faiss(
+            "openfoam_tutorials_details",
+            detail_query,
+            **kwargs,
+        )
+    except ValueError as exc:
+        print(f"Warning: Could not retrieve tutorial details: {exc}")
+        return None
+
+    selected_identity = _metadata_identity(selected)
+    exact_matches = [
+        candidate
+        for candidate in candidates
+        if _metadata_identity(candidate) == selected_identity
+    ]
+    if not exact_matches:
+        print(
+            "Warning: Details index did not return the exact case selected from "
+            "the structure index; skipping tutorial contents."
+        )
+        return None
+
+    target_structure = _normalise_structure(dir_structure)
+    exact_structure_matches = [
+        candidate
+        for candidate in exact_matches
+        if _normalise_structure(_extract_directory_structure(candidate))
+        == target_structure
+    ]
+    if not exact_structure_matches:
+        print(
+            "Warning: Details index returned matching case metadata but not the "
+            "same directory structure; skipping tutorial contents."
+        )
+        return None
+
+    return min(exact_structure_matches, key=_score_value)

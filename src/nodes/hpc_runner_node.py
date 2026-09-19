@@ -12,7 +12,7 @@ from services.run_hpc import (
     create_slurm_script,
 )
 from logger import log_review
-from openfoam_target import runtime_target_for_config
+from openfoam_target import runtime_openfoam_target
 
 
 def hpc_runner_node(state):
@@ -24,7 +24,6 @@ def hpc_runner_node(state):
     config = state["config"]
     case_dir = state["case_dir"]
     llm_service = state.get("llm_service")
-    allrun_file_path = os.path.join(case_dir, "Allrun")
     max_loop = config.max_loop
     current_attempt = 0
     
@@ -59,8 +58,7 @@ def hpc_runner_node(state):
                 case_dir,
                 cluster_info,
                 llm_service=llm_service,
-                openfoam_target=runtime_target_for_config(config),
-                openfoam_bashrc=getattr(config, "hpc_openfoam_bashrc", ""),
+                openfoam_target=runtime_openfoam_target(config),
             )
         else:
             print(f"Regenerating SLURM script based on previous error...")
@@ -76,8 +74,7 @@ def hpc_runner_node(state):
                 last_error_msg,
                 prev,
                 llm_service=llm_service,
-                openfoam_target=runtime_target_for_config(config),
-                openfoam_bashrc=getattr(config, "hpc_openfoam_bashrc", ""),
+                openfoam_target=runtime_openfoam_target(config),
             )
         
         print(f"SLURM script created at: {script_path}")
@@ -152,10 +149,14 @@ def hpc_runner_node(state):
     print("</hpc_runner>")
 
     # Return updated state
-    return {
+    result = {
         **state,
         "error_logs": error_logs,
         "job_id": job_id,
         "cluster_info": cluster_info,
         "slurm_script_path": script_path
     }
+    if not error_logs:
+        result["workflow_status"] = "success"
+        result["termination_reason"] = None
+    return result

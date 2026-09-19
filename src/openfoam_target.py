@@ -19,6 +19,7 @@ _EXPLICIT_TARGETS = frozenset({FOUNDATION_V10, ESI_V2006})
 _REQUIRED_RAW_CORPUS_FILES = frozenset(
     {
         "openfoam_case_stats.json",
+        "openfoam_commands.txt",
         "openfoam_command_help.txt",
         "openfoam_allrun_scripts.txt",
         "openfoam_tutorials_structure.txt",
@@ -54,8 +55,13 @@ def configured_openfoam_target(config: Any) -> str:
     return normalise_openfoam_target(getattr(config, "openfoam_target", ""))
 
 
-def is_esi_v2006(config: Any) -> bool:
-    return configured_openfoam_target(config) == ESI_V2006
+def runtime_openfoam_target(config: Any) -> str:
+    """Guard the default v10 runtime while retaining generic ESI compatibility."""
+    target = configured_openfoam_target(config)
+    if target:
+        return target
+    fork = (getattr(config, "openfoam_fork", "foundation") or "foundation").strip().lower()
+    return "" if fork == "esi" else FOUNDATION_V10
 
 
 def generation_convention(config: Any) -> str:
@@ -82,56 +88,41 @@ def uses_legacy_esi_translation(config: Any) -> bool:
 
 
 def database_path_for_config(config: Any) -> Path:
-    """Select a target-scoped corpus root.
-
-    Native ESI v2006 never reads ``database/`` directly: its default corpus is
-    ``database/esi-v2006``.  A separate override is useful when the v2006
-    tutorials and FAISS indices live on shared storage.
-    """
+    """Select the target subdirectory under the configured database root."""
     configured_path = getattr(config, "database_path", None)
     if not configured_path:
         configured_path = Path(__file__).resolve().parent.parent / "database"
     base_path = Path(configured_path).expanduser().resolve()
-    if is_esi_v2006(config):
-        explicit_path = getattr(config, "esi_v2006_database_path", "")
-        if explicit_path:
-            return Path(explicit_path).expanduser().resolve()
-        return base_path / ESI_V2006
-    # Native Foundation and native ESI are peer targets.  Keep the legacy
-    # ``database/`` fallback for callers with an older, unscoped corpus, but
-    # prefer the target-scoped corpus when it is present.
-    foundation_path = base_path / FOUNDATION_V10
-    if foundation_path.is_dir():
-        return foundation_path
-    return base_path
+    target = configured_openfoam_target(config) or FOUNDATION_V10
+    return base_path / target
 
 
 def require_target_corpus(config: Any) -> None:
-    """Reject a native v2006 run unless its corpus declares the same target."""
-    if not is_esi_v2006(config):
-        return
+    """Check the selected target's manifest, raw files, and embedding indices."""
+    target = configured_openfoam_target(config) or FOUNDATION_V10
+    expected_version = "2006" if target == ESI_V2006 else "10"
     database_path = database_path_for_config(config)
     manifest_path = database_path / "raw" / "foamagent_target.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(
-            "Native esi-v2006 requires a target-scoped corpus manifest at "
+            f"{target} requires a target-scoped corpus manifest at "
             f"{manifest_path}. Build it with: python init_database.py "
-            "--openfoam_target esi-v2006 --openfoam_path <ESI-v2006-root> "
+            f"--openfoam_target {target} --openfoam_path <OpenFOAM-root> "
             "--embedding_provider <provider> --embedding_model <model>."
         )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Cannot read ESI v2006 corpus manifest {manifest_path}: {exc}") from exc
-    if manifest.get("openfoam_target") != ESI_V2006:
+        raise ValueError(f"Cannot read {target} corpus manifest {manifest_path}: {exc}") from exc
+    if manifest.get("openfoam_target") != target:
         raise ValueError(
             f"Corpus manifest {manifest_path} declares "
-            f"{manifest.get('openfoam_target')!r}, not {ESI_V2006!r}."
+            f"{manifest.get('openfoam_target')!r}, not {target!r}."
         )
     version = str(manifest.get("wm_project_version", "")).lstrip("vV")
-    if version != "2006":
+    if version != expected_version:
         raise ValueError(
-            f"Corpus manifest {manifest_path} is not sourced from ESI v2006 "
+            f"Corpus manifest {manifest_path} is not sourced from {target} "
             f"(wm_project_version={manifest.get('wm_project_version')!r})."
         )
 
@@ -160,38 +151,8 @@ def require_target_corpus(config: Any) -> None:
                 f"FAISS indices for {model!r}: {', '.join(missing_indices)}"
             )
         raise FileNotFoundError(
-            "Native esi-v2006 corpus is incomplete (" + "; ".join(details) + "). "
-            "Build it with: python scripts/build_target_corpus.py "
-            "--openfoam-path <ESI-v2006-root> --force."
+            f"{target} corpus is incomplete (" + "; ".join(details) + "). "
+            f"Build it with: python init_database.py --openfoam_target {target} "
+            "--openfoam_path <OpenFOAM-root> and select the matching "
+            "--embedding_provider and --embedding_model."
         )
-
-
-def runtime_target_for_config(config: Any) -> str:
-    """Return a shell-runtime target identifier requiring an explicit guard.
-
-    Empty preserves the historical Foundation launcher command shape.  Native
-    v2006 is opt-in and must always be guarded, including mesh utilities that
-    execute before an Allrun script exists.
-    """
-    target = configured_openfoam_target(config)
-    return target if target == ESI_V2006 else ""
-
-
-def controlled_allrun_runtime_guard(platform: str) -> list[str]:
-    """Return fail-closed version checks for controlled imported cases."""
-    if platform != ESI_V2006:
-        return [
-            'if [ "${WM_PROJECT_VERSION:-}" != "10" ]; then',
-            '    echo "Foam-Agent case-import requires Foundation OpenFOAM v10 (WM_PROJECT_VERSION=10)." >&2',
-            "    exit 64",
-            "fi",
-        ]
-    return [
-        'case "${WM_PROJECT_VERSION:-}" in',
-        "    v2006|2006) ;;",
-        "    *)",
-        '        echo "Foam-Agent case-import requires ESI/OpenCFD OpenFOAM v2006 (WM_PROJECT_VERSION=v2006)." >&2',
-        "        exit 64",
-        "        ;;",
-        "esac",
-    ]

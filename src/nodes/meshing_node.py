@@ -1,5 +1,7 @@
 from services.mesh import copy_custom_mesh, prepare_standard_mesh, handle_gmsh_mesh as service_handle_gmsh_mesh
-from openfoam_target import runtime_target_for_config
+from openfoam_target import runtime_openfoam_target
+from pathlib import Path
+from utils import load_case_files, FoamfilePydantic
 
 def meshing_node(state):
     """
@@ -18,8 +20,12 @@ def meshing_node(state):
     user_requirement = state["user_requirement"]
     case_dir = state["case_dir"]
     llm_service = state.get("llm_service")
-    runtime_target = runtime_target_for_config(state["config"])
-    target_kwargs = {"openfoam_target": runtime_target} if runtime_target else {}
+    target_version = runtime_openfoam_target(state["config"])
+    repairing = bool(state.get("repairing_mesh"))
+    repair_kwargs = {
+        "repair_feedback": state.get("review_analysis") or "",
+        "retry": True,
+    } if repairing else {}
     
     # Get mesh type from state (determined by router)
     mesh_type = state.get("mesh_type", "standard_mesh")
@@ -33,7 +39,8 @@ def meshing_node(state):
             user_requirement,
             case_dir,
             llm_service=llm_service,
-            **target_kwargs,
+            openfoam_target=target_version,
+            **repair_kwargs,
         )
     elif mesh_type == "gmsh_mesh":
         print("<mesh_routing>GMSH mesh requested.</mesh_routing>")
@@ -42,15 +49,29 @@ def meshing_node(state):
             case_dir,
             state["config"].max_loop,
             llm_service=llm_service,
-            **target_kwargs,
+            openfoam_target=target_version,
+            **repair_kwargs,
         )
     else:
         print("<mesh_routing>Standard mesh generation.</mesh_routing>")
-        result = prepare_standard_mesh(user_requirement, case_dir)  # service
+        result = prepare_standard_mesh()  # service
     print("</meshing>")
+    result.update(load_case_files({**state, **result}))
     if result.get("error_logs"):
-        # There is no valid case to write or run after mesh preparation fails.
-        # Persist a terminal reason so the graph can stop before Input Writer
-        # obscures the original mesh error with unrelated dictionary failures.
-        result["termination_reason"] = "mesh_generation_failed"
+        script = Path(case_dir) / "generate_mesh.py"
+        if script.is_file() and result.get("foamfiles") is not None:
+            result["foamfiles"].list_foamfile.append(FoamfilePydantic(
+                folder_name="", file_name="generate_mesh.py",
+                content=script.read_text(encoding="utf-8"),
+            ))
+        result["repairing_mesh"] = True
+        if not repairing:
+            result["mesh_resume_state"] = {
+                key: state.get(key) for key in
+                ("input_writer_mode", "rewrite_plan", "review_analysis")
+            }
+    elif repairing:
+        result.update(state.get("mesh_resume_state") or {})
+        result["repairing_mesh"] = False
+        result["mesh_resume_state"] = None
     return result

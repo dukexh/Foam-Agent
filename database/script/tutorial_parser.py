@@ -110,7 +110,7 @@ def find_cases(root_dir):
     FOAM_TUTORIALS = os.environ.get("FOAM_TUTORIALS", "/home/somasn/Documents/LLM/OpenFOAM-10/tutorials")
     blockmesh_resource_dir = os.path.join(FOAM_TUTORIALS, "resources", "blockMesh")
 
-    for root, dirs, files in os.walk(root_dir):
+    for root, dirs, _ in os.walk(root_dir):
         stats["directories_scanned"] += 1  # Scanning this directory
 
         # Check if the current directory contains a 'system' folder

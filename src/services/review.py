@@ -1,11 +1,11 @@
+import hashlib
+import json
+from pathlib import Path
+from .case_import import snapshot_files
 from typing import List, Optional, Tuple, Any
 from pydantic import BaseModel, Field
+from models import PlannedFileChange
 from . import global_llm_service
-
-
-class PlannedFileChange(BaseModel):
-    file: str = Field(description="Relative file path, e.g. system/fvSchemes or 0/U")
-    changes: str = Field(description="Semicolon-separated concrete changes for this file")
 
 
 class RewritePlan(BaseModel):
@@ -22,18 +22,6 @@ REVIEWER_SYSTEM_PROMPT = (
     "Please do not propose solutions that require modifying any parameters declared in the user requirement, try other approaches instead. Do not ask the user any questions."
     "The user will supply all relevant foam files along with the error logs, and within the logs, you will find both the error content and the corresponding error command indicated by the log file name."
 )
-
-
-def _reviewer_system_prompt(openfoam_target: str) -> str:
-    """Add a native-version constraint without changing legacy review prompts."""
-    if openfoam_target != "esi-v2006":
-        return REVIEWER_SYSTEM_PROMPT
-    return (
-        REVIEWER_SYSTEM_PROMPT
-        + " The target is native ESI/OpenCFD OpenFOAM v2006. Diagnose and repair "
-        "only with ESI v2006 conventions from the supplied ESI tutorial reference; "
-        "do not propose Foundation v10 syntax or post-generation translation."
-    )
 
 
 def review_error_logs(
@@ -139,3 +127,49 @@ def generate_rewrite_plan(
         pydantic_obj=RewritePlan,
     )
     return response.model_dump()
+
+
+def error_fingerprint(state: dict[str, Any]) -> str:
+    """Compare errors and case inputs, excluding changing runtime outputs."""
+    files = snapshot_files(state.get("case_dir") or "")
+    inputs = {
+        name: digest for name, digest in files.items()
+        if not _is_runtime_artifact(name)
+    }
+    payload = {
+        "errors": state.get("error_logs") or [],
+        "inputs": inputs,
+        "user_requirement": state.get("user_requirement", ""),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _is_runtime_artifact(relative: str) -> bool:
+    path = Path(relative)
+    top = path.parts[0] if path.parts else ""
+    try:
+        float(top)
+    except ValueError:
+        pass
+    else:
+        return True
+    return (
+        top in {"postProcessing", "VTK", ".foamagent"}
+        or top.startswith("processor") and top.removeprefix("processor").isdigit()
+        or path.name.startswith("log")
+        or path.name in {"Allrun.out", "Allrun.err"}
+    )
+
+
+def _reviewer_system_prompt(openfoam_target: str) -> str:
+    """Add a native-version constraint without changing legacy review prompts."""
+    if openfoam_target != "esi-v2006":
+        return REVIEWER_SYSTEM_PROMPT
+    return (
+        REVIEWER_SYSTEM_PROMPT
+        + " The target is native ESI/OpenCFD OpenFOAM v2006. Diagnose and repair "
+        "only with ESI v2006 conventions from the supplied ESI tutorial reference; "
+        "do not propose Foundation v10 syntax or post-generation translation."
+    )

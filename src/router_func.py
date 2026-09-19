@@ -4,7 +4,7 @@ from utils import GraphState
 
 
 def route_workflow_entry(state: GraphState):
-    """Choose the prompt-generation or protected existing-case branch."""
+    """Choose new generation or existing-case import."""
     if state.get("workflow_mode") == "imported_case":
         print("<router>Existing case requested. Routing to case_import node.</router>")
         return "case_import"
@@ -116,6 +116,18 @@ def route_after_planner(state: GraphState):
     Route after planner node based on whether user wants custom mesh.
     For current version, if user wants custom mesh, user should be able to provide a path to the mesh file.
     """
+    if state.get("case_origin") == "imported":
+        if state.get("target_mismatch") and state.get("error_logs"):
+            print("<router>Case target mismatch detected. Routing to reviewer for repair.</router>")
+            return "reviewer"
+        if state.get("workflow_status") == "failed":
+            return END
+        if state.get("requires_meshing"):
+            return "meshing"
+        if state.get("requires_input_writer"):
+            return "input_writer"
+        return _route_runner(state)
+
     mesh_type = state.get("mesh_type", "standard_mesh")
     if mesh_type == "custom_mesh":
         print("<router>Custom mesh requested. Routing to meshing node.</router>")
@@ -129,10 +141,11 @@ def route_after_planner(state: GraphState):
 
 
 def route_after_meshing(state: GraphState):
-    """Continue only when a requested mesh was prepared successfully."""
+    """Route imported cases as planned; generated cases continue to Input Writer."""
     if state.get("error_logs"):
-        print("<router>Mesh preparation failed. Ending workflow.</router>")
-        return END
+        return "reviewer"
+    if state.get("case_origin") == "imported":
+        return "input_writer" if state.get("requires_input_writer") else _route_runner(state)
     return "input_writer"
 
 
@@ -141,6 +154,17 @@ def route_after_input_writer(state: GraphState):
     Route after input_writer node based on whether user wants to run on HPC.
     Prefer planner-cached decision to avoid repeated LLM routing jitter.
     """
+    if state.get("error_logs"):
+        return "reviewer"
+
+    if state.get("repairing_mesh"):
+        return "meshing"
+
+    return _route_runner(state)
+
+
+def _route_runner(state: GraphState):
+    """Select the shared local or HPC runner."""
     requires_hpc = state.get("requires_hpc")
     if requires_hpc is None:
         requires_hpc = llm_requires_hpc(state)
@@ -167,26 +191,21 @@ def route_after_runner(state: GraphState):
     return END
 
 def route_after_case_import(state: GraphState):
-    """Merge a validated imported case into the common local-runner path."""
-    return "local_runner" if state.get("case_import_status") == "ready" else END
+    """Imported cases now enter the normal planner and LLM repair workflow."""
+    if state.get("workflow_status") == "failed":
+        return END
+    return "planner"
 
 
 def route_after_reviewer(state: GraphState):
-    """Retry through the common runner, subject to the source repair policy."""
-    repair_policy = state.get("repair_policy", "llm_rewrite")
-    if repair_policy == "numeric_invariant_only":
-        return (
-            "local_runner"
-            if state.get("case_import_status") == "ready"
-            else END
-        )
-    if repair_policy != "llm_rewrite":
+    """Use the same file-rewrite loop for generated and imported cases."""
+    if state.get("termination_reason") == "repair_made_no_progress":
         return END
-
     loop_count = state.get("loop_count", 0)
-    max_loop = state["config"].max_loop
-    if loop_count >= max_loop:
-        print(f"<router>Maximum loop count ({max_loop}) reached. Ending workflow.</router>")
+    if loop_count >= state["config"].max_loop:
+        print(f"<router>Maximum loop count ({state['config'].max_loop}) reached. Ending workflow.</router>")
+        if state.get("repairing_mesh"):
+            return END
         requires_visualization = state.get("requires_visualization")
         if requires_visualization is None:
             requires_visualization = llm_requires_visualization(state)
@@ -194,4 +213,6 @@ def route_after_reviewer(state: GraphState):
         return "visualization" if requires_visualization else END
 
     print(f"<router>Loop {loop_count}: Continuing to fix errors.</router>")
+    if state.get("repairing_mesh") and not (state.get("rewrite_plan") or {}).get("target_files"):
+        return "meshing"
     return "input_writer"

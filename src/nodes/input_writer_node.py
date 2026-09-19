@@ -3,11 +3,7 @@
 from utils import read_case_foamfiles, scan_case_directory
 from services.input_writer import initial_write, build_allrun, rewrite_files
 from translation.esi_translator import convert_case_to_esi_if_needed
-from openfoam_target import (
-    database_path_for_config,
-    generation_convention,
-    uses_legacy_esi_translation,
-)
+from openfoam_target import database_path_for_config, generation_convention, uses_legacy_esi_translation
 
 def input_writer_node(state):
     """
@@ -81,7 +77,7 @@ def _initial_write_mode(state):
     # Build Allrun via service
     mesh_type = state.get("mesh_type")
     mesh_commands = state.get("mesh_commands") or []
-    allrun_out = build_allrun(
+    build_allrun(
         case_dir=state["case_dir"],
         database_path=str(database_path_for_config(config)),
         searchdocs=config.searchdocs,
@@ -93,6 +89,7 @@ def _initial_write_mode(state):
         user_requirement=state["user_requirement"],
         llm_service=state.get("llm_service"),
         config=config,
+        openfoam_fork=generation_convention(config),
     )
 
     print("</input_writer>")
@@ -106,6 +103,7 @@ def _initial_write_mode(state):
 
     return {
         "dir_structure": dir_structure,
-        "commands": allrun_out["commands"],
+        "commands": [],
         "foamfiles": foamfiles,
     }
+

@@ -5,9 +5,10 @@ exposing OpenFOAM simulation capabilities through clean, well-typed interfaces.
 """
 
 import asyncio
+from copy import deepcopy
 import os
 import json
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP, Context
 from pydantic import BaseModel, Field
@@ -25,16 +26,17 @@ from services.input_writer import initial_write
 from services.run_local import run_allrun_and_collect_errors
 
 from utils import FoamPydantic, read_case_foamfiles, scan_case_directory
-from services.review import review_error_logs
+from services.review import generate_rewrite_plan, review_error_logs
 from translation.esi_translator import convert_case_to_esi_if_needed
 from services.visualization import visualize_case
 from services.output_safety import prepare_output_directory
 from config import Config
 from openfoam_target import (
+    runtime_openfoam_target,
     database_path_for_config,
     generation_convention,
+    normalise_openfoam_target,
     require_target_corpus,
-    runtime_target_for_config,
     uses_legacy_esi_translation,
 )
 
@@ -62,8 +64,8 @@ v2006 corpus and native conventions, local execution sources and validates the v
 and review/fix uses the same target convention. The native target bypasses the legacy translator.
 It requires a matching ESI v2006 runtime and target corpus.
 
-Existing-case import is currently exposed through the CLI/StateGraph workflow, not as a separate
-FastMCP tool. Imported cases use the controlled local execution path and do not invoke LLM repair.
+Existing-case import is exposed through the run_case tool. It uses the shared StateGraph workflow,
+including target detection, planning, controlled execution, review, and targeted repair.
 """
 )
 
@@ -183,11 +185,6 @@ async def input_writer(
 
         await ctx.info(f"Case directory: {case_dir}")
 
-        # Load case statistics and retrieve references
-        case_stats_path = database_path_for_config(global_config) / "raw" / "openfoam_case_stats.json"
-        with open(case_stats_path, 'r') as f:
-            case_stats = json.load(f)
-
         # Build case info from request
         case_info = {
             "case_name": request.case_name,
@@ -199,7 +196,7 @@ async def input_writer(
         await ctx.info(f"Case info: {case_info}")
 
         # Retrieve references
-        tutorial_reference, dir_structure, dir_counts_str, allrun_reference, similar_case_advice = retrieve_references(
+        tutorial_reference, _, _, allrun_reference, similar_case_advice = retrieve_references(
             case_name=case_info["case_name"],
             case_solver=case_info["case_solver"],
             case_domain=case_info["case_domain"],
@@ -337,7 +334,7 @@ async def run(
             case_dir=request.case_dir,
             timeout=request.timeout,
             max_retries=3,
-            openfoam_target=runtime_target_for_config(global_config),
+            openfoam_target=runtime_openfoam_target(global_config),
         )
         
         # Convert error logs to strings if they're dictionaries
@@ -412,12 +409,7 @@ async def review(
         # Validate case directory exists
         if not os.path.exists(request.case_dir):
             raise ValueError(f"Case directory does not exist: {request.case_dir}")
-        
-        # Load case statistics
-        case_stats_path = database_path_for_config(global_config) / "raw" / "openfoam_case_stats.json"
-        with open(case_stats_path, 'r') as f:
-            case_stats = json.load(f)
-        
+
         # Extract case name from case_dir for reference lookup
         case_name = os.path.basename(request.case_dir)
         
@@ -542,25 +534,32 @@ async def apply_fixes(
         
         await ctx.info("Rewriting OpenFOAM files based on review analysis...")
         
-        # Directly call rewrite_files - it now handles file reading internally
+        # Build the same explicit, file-scoped repair plan used by the graph.
         from services.input_writer import rewrite_files
-        
+
+        foamfiles = read_case_foamfiles(request.case_dir)
+        rewrite_plan = generate_rewrite_plan(
+            foamfiles=foamfiles,
+            error_logs=request.error_logs,
+            review_analysis=request.review_analysis,
+            user_requirement=request.user_requirement,
+            openfoam_target=generation_convention(global_config),
+        )
+
         result = rewrite_files(
             case_dir=request.case_dir,
             error_logs=request.error_logs,
             review_analysis=request.review_analysis,
-            rewrite_plan=None,
+            rewrite_plan=rewrite_plan,
             user_requirement=request.user_requirement,
+            foamfiles=foamfiles,
             openfoam_fork=generation_convention(global_config),
-            # foamfiles and dir_structure will be read automatically if None
         )
-        
-        # Extract written file paths
-        written_files = []
-        if result.get("foamfiles") and hasattr(result["foamfiles"], "list_foamfile"):
-            for foamfile in result["foamfiles"].list_foamfile:
-                file_path = os.path.join(request.case_dir, foamfile.folder_name, foamfile.file_name)
-                written_files.append(file_path)
+
+        written_files = [
+            os.path.join(request.case_dir, relative_path)
+            for relative_path in result.get("updated_files", [])
+        ]
         
         status = "ok" if written_files else "no_changes"
         
@@ -573,6 +572,96 @@ async def apply_fixes(
         
     except Exception as e:
         await ctx.error(f"Failed to apply fixes: {str(e)}")
+        raise
+
+
+# ============================================================================
+# Tool: run_case
+# ============================================================================
+
+class RunCaseRequest(BaseModel):
+    """Request to import and run an existing OpenFOAM case."""
+
+    case_path: str = Field(description="Existing OpenFOAM case directory or ZIP archive")
+    output_dir: str = Field(description="Destination for the read-only original, writable work tree, and report")
+    user_requirement: str = Field(
+        default="",
+        description="Optional requested changes; empty preserves a complete case before running it",
+    )
+    case_subdir: Optional[str] = Field(
+        default=None,
+        description="Relative case directory when the source contains multiple OpenFOAM cases",
+    )
+    custom_mesh_path: Optional[str] = Field(
+        default=None,
+        description="Optional external mesh used by the imported-case workflow",
+    )
+    openfoam_target: Optional[str] = Field(
+        default=None,
+        description="Optional explicit native target: foundation-v10 or esi-v2006",
+    )
+    overwrite_output: bool = Field(
+        default=False,
+        description="Allow replacement of an existing Foam-Agent-owned output directory",
+    )
+
+
+class RunCaseResponse(BaseModel):
+    """Terminal state of the shared existing-case workflow."""
+
+    status: str = Field(description="Workflow status: success, partial_success or failed")
+    message: Optional[str] = Field(default=None, description="Workflow completion summary")
+    visualization_error: Optional[str] = Field(default=None, description="Visualization failure details")
+    case_dir: str = Field(description="Writable imported case directory")
+    report_dir: Optional[str] = Field(description="Directory containing import and workflow reports")
+    errors: List[Any] = Field(description="Terminal execution or workflow errors")
+    termination_reason: Optional[str] = Field(description="Reason the workflow stopped, if it failed")
+
+
+@mcp.tool(name="run_case")
+async def run_case(request: RunCaseRequest, ctx: Context) -> RunCaseResponse:
+    """Import an existing case or ZIP and execute the shared repair workflow."""
+    try:
+        if not request.case_path.strip():
+            raise ValueError("case_path is required.")
+        if not request.output_dir.strip():
+            raise ValueError("output_dir is required.")
+
+        config = deepcopy(global_config)
+        config.case_dir = request.output_dir
+        config.overwrite_case_dir = request.overwrite_output
+        if request.openfoam_target is not None:
+            config.openfoam_target = normalise_openfoam_target(request.openfoam_target)
+
+        await ctx.info(f"Importing and running existing case: {request.case_path}")
+
+        # Import lazily so starting the MCP server does not execute CLI-only code.
+        from main import main as run_workflow
+
+        result = await asyncio.to_thread(
+            run_workflow,
+            request.user_requirement,
+            config,
+            request.custom_mesh_path,
+            case_path=request.case_path,
+            case_subdir=request.case_subdir,
+        )
+
+        termination_reason = result.get("termination_reason")
+        failed = result.get("workflow_status") == "failed" or bool(termination_reason)
+        status = "partial_success" if result.get("workflow_status") == "partial_success" else ("failed" if failed else "success")
+        await ctx.info(f"Existing-case workflow finished with status: {status}")
+        return RunCaseResponse(
+            status=status,
+            message=result.get("workflow_message"),
+            visualization_error=result.get("visualization_error"),
+            case_dir=result.get("case_dir") or request.output_dir,
+            report_dir=result.get("case_import_report_dir"),
+            errors=list(result.get("error_logs") or []),
+            termination_reason=termination_reason,
+        )
+    except Exception as e:
+        await ctx.error(f"Failed to run existing case: {str(e)}")
         raise
 
 
@@ -612,8 +701,7 @@ async def visualization(
         if not os.path.exists(request.case_dir):
             raise ValueError(f"Case directory does not exist: {request.case_dir}")
         
-        result = await asyncio.to_thread(
-            visualize_case,
+        result = visualize_case(
             request.case_dir,
             request.quantity,
             max_loop=max(1, min(global_config.max_loop, 2)),

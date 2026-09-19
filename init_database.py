@@ -27,16 +27,11 @@ TARGET_SOURCES = {
 }
 REQUIRED_RAW_CORPUS_FILES = (
     "openfoam_case_stats.json",
+    "openfoam_commands.txt",
     "openfoam_command_help.txt",
     "openfoam_allrun_scripts.txt",
     "openfoam_tutorials_structure.txt",
     "openfoam_tutorials_details.txt",
-)
-REQUIRED_FAISS_INDICES = (
-    "openfoam_command_help",
-    "openfoam_allrun_scripts",
-    "openfoam_tutorials_structure",
-    "openfoam_tutorials_details",
 )
 
 def parse_args():

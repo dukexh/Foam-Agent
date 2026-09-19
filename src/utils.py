@@ -1,5 +1,6 @@
 # utils.py
 import re
+import json
 import subprocess
 import os
 import signal
@@ -16,7 +17,6 @@ import tracking_aws
 import requests
 import time
 import random
-import threading
 from botocore.exceptions import ClientError
 import shutil
 from config import Config
@@ -29,25 +29,14 @@ except ImportError:
 
 
 FAISSCacheKey = tuple[str, str, str]
-
-# Cache FAISS indices by their full retrieval configuration.  A process can
-# serve more than one workflow (notably through MCP), so a single global index
-# set would otherwise mix embeddings or tutorial corpora from unrelated
-# Config instances.
 FAISS_DB_CACHE: Dict[FAISSCacheKey, Dict[str, Any]] = {}
-_FAISS_DB_CACHE_LOCK = threading.RLock()
-
-
-def _configured_database_path(config: Config) -> Path:
-    """Resolve the platform-scoped database root for one configuration."""
-    return database_path_for_config(config)
 
 
 def _faiss_cache_key(config: Config) -> FAISSCacheKey:
     """Return the cache identity for one embedding/index configuration."""
     provider = str(getattr(config, "embedding_provider", "openai") or "openai").casefold()
     model = str(getattr(config, "embedding_model", "") or "")
-    return (str(_configured_database_path(config)), provider, model)
+    return (str(database_path_for_config(config)), provider, model)
 
 def get_embedding_model(config: Optional[Config] = None):
     """Return an embedding model based on the provided config.
@@ -80,7 +69,7 @@ def load_faiss_dbs(config: Optional[Config] = None):
     require_target_corpus(cfg)
     embedding_model = get_embedding_model(cfg)
 
-    base_dir = _configured_database_path(cfg) / "faiss"
+    base_dir = database_path_for_config(cfg) / "faiss"
 
     # Sanitize model name for directory usage
     model_dir_name = (cfg.embedding_model or "").replace("/", "_").replace(":", "_")
@@ -116,16 +105,15 @@ def load_faiss_dbs(config: Optional[Config] = None):
 # that does not use RAG (for example preflight validation) must stay local and
 # deterministic.
 def _ensure_faiss_dbs_loaded(config: Optional[Config] = None) -> Dict[str, Any]:
-    """Load and return the index set matching ``config`` exactly once."""
+    """Load or reuse the index set matching ``config``."""
     cfg = config or Config()
     cache_key = _faiss_cache_key(cfg)
-    with _FAISS_DB_CACHE_LOCK:
-        # An empty mapping is also a cached result: repeatedly attempting to
-        # load a missing index set is expensive and obscures the original
-        # configuration error.
-        if cache_key not in FAISS_DB_CACHE:
-            FAISS_DB_CACHE[cache_key] = load_faiss_dbs(cfg)
-        return FAISS_DB_CACHE[cache_key]
+    # An empty mapping is also a cached result: repeatedly attempting to
+    # load a missing index set is expensive and obscures the original
+    # configuration error.
+    if cache_key not in FAISS_DB_CACHE:
+        FAISS_DB_CACHE[cache_key] = load_faiss_dbs(cfg)
+    return FAISS_DB_CACHE[cache_key]
 
 class FoamfilePydantic(BaseModel):
     file_name: str = Field(description="Name of the OpenFOAM input file")
@@ -134,10 +122,6 @@ class FoamfilePydantic(BaseModel):
 
 class FoamPydantic(BaseModel):
     list_foamfile: List[FoamfilePydantic] = Field(description="List of OpenFOAM configuration files")
-
-class ResponseWithThinkPydantic(BaseModel):
-    think: str = Field(description="Thought process of the LLM")
-    response: str = Field(description="Response of the LLM")
 
 class _CodexResponsesWrapper:
     """Wrapper for an OpenAI Responses-compatible endpoint.
@@ -304,7 +288,8 @@ class _CodexResponsesWrapper:
                 break
             yield data
 
-    def _response_headers(self) -> dict[str, str]:
+    def invoke(self, messages):
+        url = f"{self._base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self._token}",
             "Content-Type": "application/json",
@@ -313,60 +298,61 @@ class _CodexResponsesWrapper:
         }
         if self._account_id:
             headers["ChatGPT-Account-Id"] = self._account_id
-        return headers
 
-    def _post_responses_request(self, messages) -> requests.Response:
-        """Send one Responses request and preserve useful HTTP failure detail."""
-        url = f"{self._base_url}/responses"
         payload = self._build_payload(messages)
+
+        # ChatGPT Codex backend can take 60-180s on complex prompts when
+        # reasoning.summary=auto is enabled — the model spends time on the
+        # reasoning trace before emitting tokens. The previous hardcoded 60s
+        # was too tight: prompts with non-trivial BC topology (e.g. a 2-inlet
+        # elbow channel) deterministically exceeded it on gpt-5.5, raising
+        # `HTTPSConnectionPool ... Read timed out. (read timeout=60)` and
+        # failing the workflow. Allow operator override via env var.
         timeout = int(os.environ.get("FOAMAGENT_HTTP_TIMEOUT", "300"))
-        response = requests.post(
-            url,
-            headers=self._response_headers(),
-            json=payload,
-            timeout=timeout,
-            stream=bool(self._stream),
-        )
-        if not response.ok:
+        r = requests.post(url, headers=headers, json=payload, timeout=timeout, stream=bool(self._stream))
+
+        # If we get an error, surface the response body to aid debugging.
+        if not r.ok:
             try:
-                detail = response.text[:2000]
-            except requests.RequestException:
+                detail = r.text[:2000]
+            except Exception:
                 detail = ""
             raise requests.HTTPError(
-                f"HTTP {response.status_code} for {url}. Body: {detail}",
-                response=response,
+                f"HTTP {r.status_code} for {url}. Body: {detail}", response=r
             )
-        return response
 
-    def _stream_output_text(self, response: requests.Response) -> str:
-        """Accumulate supported Responses SSE text events with a safe fallback."""
+        if not self._stream:
+            data = r.json()
+            return self._Resp(self._extract_output_text(data))
+
+        # Streaming: accumulate text deltas.
         import json
 
         chunks: list[str] = []
-        for text in self._iter_sse_text(response):
+        for s in self._iter_sse_text(r):
             try:
-                event = json.loads(text)
-            except json.JSONDecodeError:
+                j = json.loads(s)
+            except Exception:
                 continue
-            if isinstance(event, dict):
-                event_type = event.get("type")
-                if event_type == "response.output_text.delta" and isinstance(event.get("delta"), str):
-                    chunks.append(event["delta"])
-                    continue
-                if event_type == "response.output_text.done" and isinstance(event.get("text"), str):
-                    if not chunks:
-                        chunks.append(event["text"])
-                    continue
-            fallback = self._extract_output_text(event)
-            if fallback:
-                chunks.append(fallback)
-        return "".join(chunks).strip()
 
-    def invoke(self, messages):
-        response = self._post_responses_request(messages)
-        if self._stream:
-            return self._Resp(self._stream_output_text(response))
-        return self._Resp(self._extract_output_text(response.json()))
+            # Codex backend streams OpenAI Responses-style events.
+            if isinstance(j, dict):
+                t = j.get("type")
+                if t == "response.output_text.delta" and isinstance(j.get("delta"), str):
+                    chunks.append(j["delta"])
+                    continue
+                if t == "response.output_text.done" and isinstance(j.get("text"), str):
+                    # Some clients rely on done; we already collected deltas but keep as fallback.
+                    if not chunks:
+                        chunks.append(j["text"])
+                    continue
+
+            # Fallback: try generic extraction.
+            t2 = self._extract_output_text(j)
+            if t2:
+                chunks.append(t2)
+
+        return self._Resp("".join(chunks).strip())
 
 
 class LLMService:
@@ -739,87 +725,6 @@ class LLMService:
         time.sleep(delay)
         return retry_count
 
-    @staticmethod
-    def _messages_for_request(user_prompt: str, system_prompt: Optional[str]) -> list[dict[str, str]]:
-        messages: list[dict[str, str]] = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_prompt})
-        return messages
-
-    def _invoke_deepseek_structured(
-        self,
-        messages: list[dict[str, str]],
-        schema: Type[BaseModel],
-    ) -> BaseModel:
-        """Use the JSON prompt fallback required by DeepSeek thinking mode."""
-        json_instruction = (
-            "Return ONLY valid JSON (no markdown, no extra text) matching this schema:\n"
-            + str(schema.model_json_schema())
-        )
-        raw_response = self.llm.invoke(
-            [*messages, {"role": "user", "content": json_instruction}]
-        )
-        text = raw_response.content.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", text)
-            text = re.sub(r"\n?```\s*$", "", text).strip()
-        return schema.model_validate_json(text)
-
-    def _invoke_model(
-        self,
-        messages: list[dict[str, str]],
-        pydantic_obj: Optional[Type[BaseModel]],
-    ) -> Any:
-        """Call the configured provider, including its structured-output variant."""
-        if pydantic_obj is None:
-            return self.llm.invoke(messages).content
-        if self.model_provider.lower() == "deepseek":
-            return self._invoke_deepseek_structured(messages, pydantic_obj)
-        return self.llm.with_structured_output(pydantic_obj).invoke(messages)
-
-    def _record_successful_response(self, response: Any, prompt_tokens: int) -> None:
-        completion_tokens = self.llm.get_num_tokens(str(response))
-        self.total_prompt_tokens += prompt_tokens
-        self.total_completion_tokens += completion_tokens
-        self.total_tokens += prompt_tokens + completion_tokens
-
-    def _retry_counts_after_error(
-        self,
-        error: Exception,
-        *,
-        retry_count: int,
-        transport_retry_count: int,
-        structured_retry_count: int,
-        max_retries: int,
-        has_structured_output: bool,
-    ) -> tuple[int, int, int]:
-        """Sleep and return updated counters for retryable failures, else raise."""
-        if self._is_throttling_error(error):
-            updated = self._handle_throttling_retry(error, retry_count, max_retries)
-            if updated is not None:
-                return updated, transport_retry_count, structured_retry_count
-            self.failed_calls += 1
-            raise RuntimeError(
-                f"Maximum retries ({max_retries}) exceeded for throttling error: {error}"
-            ) from error
-        if self._is_retryable_transport_error(error):
-            updated = self._handle_transport_retry(error, transport_retry_count, 3)
-            if updated is not None:
-                return retry_count, updated, structured_retry_count
-            self.failed_calls += 1
-            raise error
-        if has_structured_output and self._is_retryable_structured_response_error(error):
-            updated = self._handle_structured_response_retry(error, structured_retry_count, 3)
-            if updated is not None:
-                return retry_count, transport_retry_count, updated
-            self.failed_calls += 1
-            raise error
-        print(f"Non-throttling error occurred: {error}.")
-        if isinstance(error, ClientError):
-            print(error.response)
-        self.failed_calls += 1
-        raise error
 
     def invoke(self,
               user_prompt: str, 
@@ -840,27 +745,90 @@ class LLMService:
         """
         self.total_calls += 1
         
-        messages = self._messages_for_request(user_prompt, system_prompt)
-        prompt_tokens = sum(self.llm.get_num_tokens(message["content"]) for message in messages)
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        
+        # Calculate prompt tokens
+        prompt_tokens = 0
+        for message in messages:
+            prompt_tokens += self.llm.get_num_tokens(message["content"])
+        
         retry_count = 0
         transport_retry_count = 0
         structured_response_retry_count = 0
         while True:
             try:
-                response = self._invoke_model(messages, pydantic_obj)
-                self._record_successful_response(response, prompt_tokens)
+                if pydantic_obj:
+                    if self.model_provider.lower() == "deepseek":
+                        # DeepSeek thinking mode does not support response_format,
+                        # so with_structured_output fails. Use JSON prompt fallback.
+                        schema = pydantic_obj.model_json_schema()
+                        json_instruction = (
+                            "Return ONLY valid JSON (no markdown, no extra text) matching this schema:\n"
+                            + str(schema)
+                        )
+                        json_messages = list(messages)
+                        json_messages.append({"role": "user", "content": json_instruction})
+                        raw_response = self.llm.invoke(json_messages)
+                        raw_text = raw_response.content
+                        # Strip markdown fences if present
+                        t = raw_text.strip()
+                        if t.startswith("```"):
+                            t = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", t)
+                            t = re.sub(r"\n?```\s*$", "", t).strip()
+                        response = pydantic_obj.model_validate_json(t)
+                    else:
+                        structured_llm = self.llm.with_structured_output(pydantic_obj)
+                        response = structured_llm.invoke(messages)
+                else:
+                    response = self.llm.invoke(messages)
+                    response = response.content
+
+                # Calculate completion tokens
+                response_content = str(response)
+                completion_tokens = self.llm.get_num_tokens(response_content)
+                total_tokens = prompt_tokens + completion_tokens
+                
+                # Update statistics
+                self.total_prompt_tokens += prompt_tokens
+                self.total_completion_tokens += completion_tokens
+                self.total_tokens += total_tokens
+                
                 return response
-            except Exception as error:  # noqa: BLE001 - provider exceptions have no common base class
-                retry_count, transport_retry_count, structured_response_retry_count = (
-                    self._retry_counts_after_error(
-                        error,
-                        retry_count=retry_count,
-                        transport_retry_count=transport_retry_count,
-                        structured_retry_count=structured_response_retry_count,
-                        max_retries=max_retries,
-                        has_structured_output=pydantic_obj is not None,
-                    )
-                )
+                
+            except Exception as e:
+                if self._is_throttling_error(e):
+                    print(f"ThrottlingException occurred: {str(e)}.")
+                    print(f"Retrying: {retry_count + 1}/{max_retries}")
+                    retry_count = self._handle_throttling_retry(e, retry_count, max_retries)
+                    if retry_count is None:
+                        # Max retries exceeded
+                        self.failed_calls += 1
+                        raise RuntimeError(f"Maximum retries ({max_retries}) exceeded for throttling error: {str(e)}") from e
+                    continue
+                elif self._is_retryable_transport_error(e):
+                    transport_retry_count = self._handle_transport_retry(e, transport_retry_count, 3)
+                    if transport_retry_count is None:
+                        self.failed_calls += 1
+                        raise
+                    continue
+                elif pydantic_obj is not None and self._is_retryable_structured_response_error(e):
+                    structured_response_retry_count = self._handle_structured_response_retry(e, structured_response_retry_count, 3)
+                    if structured_response_retry_count is None:
+                        self.failed_calls += 1
+                        raise
+                    continue
+                else:
+                    print(f"Non-throttling error occurred: {str(e)}.")
+
+                    # Non-throttling error: log and raise
+                    print(f"Error occurred in LLM service: {str(e)}")
+                    if isinstance(e, ClientError):
+                        print(e.response)
+                    self.failed_calls += 1
+                    raise e
     
     def get_statistics(self) -> dict:
         """
@@ -898,16 +866,21 @@ class LLMService:
         print(f"Average tokens per call: {stats['average_tokens']:.2f}\n")
         print("</LLM Service Statistics>")
 
+def load_agent_resources(config: Any) -> tuple[Any, Any]:
+    """Build the target-specific LLM client and case statistics on demand."""
+    require_target_corpus(config)
+    stats_path = database_path_for_config(config) / "raw" / "openfoam_case_stats.json"
+    with stats_path.open(encoding="utf-8") as handle:
+        case_stats = json.load(handle)
+    return LLMService(config), case_stats
+
+
 class GraphState(TypedDict):
     user_requirement: str
     config: Config
     case_dir: str
-    tutorial: str
     case_name: str
     subtasks: List[dict]
-    current_subtask_index: int
-    error_command: Optional[str]
-    error_content: Optional[str]
     loop_count: int
     # Additional state fields that will be added during execution
     llm_service: Optional['LLMService']
@@ -930,6 +903,8 @@ class GraphState(TypedDict):
     mesh_commands: Optional[List[str]]
     custom_mesh_used: Optional[bool]
     mesh_type: Optional[str]
+    repairing_mesh: bool
+    mesh_resume_state: Optional[dict]
     custom_mesh_path: Optional[str]
     # Review and rewrite related fields
     review_analysis: Optional[str]
@@ -944,20 +919,22 @@ class GraphState(TypedDict):
     cluster_info: Optional[dict]
     slurm_script_path: Optional[str]
     termination_reason: Optional[str]
-    # Existing-case import branch.  These fields keep the imported source and
-    # its controlled retry history separate from generated-case dictionaries.
+    # Existing cases participate in the same planner/writer/runner/reviewer graph.
     workflow_mode: str
-    execution_policy: str
-    repair_policy: str
+    case_origin: str
+    user_requirement_explicit: bool
     case_import_path: Optional[str]
     case_import_subdir: Optional[str]
     case_import_manifest: Optional[Any]
-    case_import_original_dir: Optional[str]
     case_import_report_dir: Optional[str]
-    case_import_attempts: Optional[List[dict]]
-    case_import_overrides: Optional[Dict[str, bytes]]
-    case_import_error_fingerprints: Optional[List[str]]
-    case_import_status: Optional[str]
+    case_context: Optional[dict]  # Import snapshot for initial checks and case selection.
+    requires_meshing: bool
+    requires_input_writer: bool
+    workflow_status: str
+    visualization_error: Optional[str]
+    workflow_message: Optional[str]
+    error_fingerprints: List[str]
+    target_mismatch: bool
 
 def tokenize(text: str) -> str:
     # Replace underscores with spaces
@@ -978,10 +955,6 @@ def read_file(path: str) -> str:
             return f.read()
     return ""
 
-def list_case_files(case_dir: str) -> str:
-    files = [f for f in os.listdir(case_dir) if os.path.isfile(os.path.join(case_dir, f))]
-    return ", ".join(files)
-
 def remove_files(directory: str, prefix: str) -> None:
     for file in os.listdir(directory):
         if file.startswith(prefix):
@@ -989,8 +962,6 @@ def remove_files(directory: str, prefix: str) -> None:
     print(f"Removed files with prefix '{prefix}' in {directory}")
 
 def remove_file(path: str) -> None:
-    # ``exists`` is false for dangling symlinks.  ``lexists`` lets us unlink
-    # the link itself without ever following its target.
     if os.path.lexists(path):
         os.remove(path)
         print(f"Removed file {path}")
@@ -1064,7 +1035,7 @@ def scan_case_directory(case_dir: str) -> Dict[str, List[str]]:
     base_depth = case_dir.rstrip(os.sep).count(os.sep)
     
     # Walk through the directory tree
-    for root, dirs, files in os.walk(case_dir):
+    for root, _, files in os.walk(case_dir):
         # Only process directories one level below case_dir
         current_depth = root.rstrip(os.sep).count(os.sep)
         if current_depth == base_depth + 1:
@@ -1141,12 +1112,6 @@ def run_command(
     *,
     openfoam_target: str = "",
 ) -> Dict[str, Any]:
-    """Run an OpenFOAM shell script and return its process outcome.
-
-    Existing callers may continue to ignore the return value.  Callers which
-    need reliable execution status can inspect ``returncode`` and
-    ``timed_out`` instead of inferring success solely from log contents.
-    """
     print(f"Executing script {script_path} in {working_dir}")
     script = Path(script_path).expanduser().resolve()
     if not script.is_file():
@@ -1168,9 +1133,8 @@ def run_command(
     # metacharacters from being interpreted as code.  Clear the positional
     # parameters before sourcing the ESI bashrc: it treats them as optional
     # configuration arguments rather than as opaque values.
-    # The explicit v2006 target must never accidentally execute against a
-    # sourced Foundation (or a different ESI) installation.  Legacy callers
-    # pass the empty value and retain the exact historical command shape.
+    # Explicit native targets must execute against their matching installation.
+    # Legacy callers pass the empty value and retain the historical command shape.
     shell_command = (
         'foamagent_bashrc="$1"; foamagent_script="$2"; foamagent_target="$3"; '
         'set --; source "$foamagent_bashrc" || exit $?; '
@@ -1179,6 +1143,11 @@ def run_command(
         '*) echo "Foam-Agent requires ESI/OpenCFD OpenFOAM v2006; '
         'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64 ;; '
         'esac; '
+        'elif [ "$foamagent_target" = "foundation-v10" ]; then '
+        'if [ "${WM_PROJECT_VERSION:-}" != "10" ]; then '
+        'echo "Foam-Agent requires Foundation OpenFOAM v10; '
+        'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64; '
+        'fi; '
         'fi; '
         'exec bash "$foamagent_script"'
     )
@@ -1213,8 +1182,6 @@ def run_command(
             try:
                 os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             except ProcessLookupError:
-                # The process can exit between ``wait`` timing out and the
-                # group lookup; its return code is still collected below.
                 pass
             process.wait()
             timeout_message = (
@@ -1223,6 +1190,8 @@ def run_command(
             out.write(timeout_message)
             err.write(timeout_message)
             print(f"Execution timed out: {script_path}")
+
+    
 
     print(f"Executed script {script_path}")
     return {
@@ -1240,10 +1209,9 @@ def run_openfoam_utility(
 ) -> subprocess.CompletedProcess[str]:
     """Execute one OpenFOAM utility with the requested native runtime.
 
-    Legacy callers retain direct ``subprocess.run`` behaviour.  Native v2006
-    mesh preprocessing happens before an ``Allrun`` exists, so it must source
-    and validate the selected installation itself instead of relying on a
-    later runner guard.
+    Legacy callers retain direct ``subprocess.run`` behaviour. Native target
+    mesh preprocessing happens before an ``Allrun`` exists, so it sources and
+    validates the selected installation itself.
     """
     if not command:
         raise ValueError("OpenFOAM utility command must not be empty.")
@@ -1256,14 +1224,14 @@ def run_openfoam_utility(
         "text": True,
         "timeout": timeout,
     }
-    if openfoam_target != "esi-v2006":
+    if openfoam_target not in {"foundation-v10", "esi-v2006"}:
         return subprocess.run(command, **run_kwargs)
 
     openfoam_dir = os.getenv("WM_PROJECT_DIR")
     if not openfoam_dir:
         raise RuntimeError(
-            "Native esi-v2006 mesh processing requires WM_PROJECT_DIR. "
-            "Pass --openfoam_path <ESI-v2006-root> or source its etc/bashrc."
+            f"Native {openfoam_target} mesh processing requires WM_PROJECT_DIR. "
+            "Pass --openfoam_path for the selected installation or source its etc/bashrc."
         )
     bashrc_path = Path(openfoam_dir).expanduser() / "etc" / "bashrc"
     if not bashrc_path.is_file():
@@ -1274,8 +1242,8 @@ def run_openfoam_utility(
         'foamagent_command=("$@"); set --; '
         'source "$foamagent_bashrc" || exit $?; '
         'case "$target:${WM_PROJECT_VERSION:-}" in '
-        'esi-v2006:v2006|esi-v2006:2006) ;; '
-        '*) echo "Foam-Agent requires ESI/OpenCFD OpenFOAM v2006; '
+        'esi-v2006:v2006|esi-v2006:2006|foundation-v10:10) ;; '
+        '*) echo "Foam-Agent runtime does not match target $target; '
         'active WM_PROJECT_VERSION=${WM_PROJECT_VERSION:-unset}" >&2; exit 64 ;; '
         'esac; '
         'exec "${foamagent_command[@]}"'
@@ -1293,112 +1261,34 @@ def run_openfoam_utility(
         **run_kwargs,
     )
 
+
 _EXPLICIT_FOAM_ERROR_RE = re.compile(r"ERROR:(.*)", re.DOTALL)
-_SEMANTIC_FOAM_FAILURES = (
-    (
-        re.compile(r"Failed\s+\d+\s+mesh\s+checks?", re.IGNORECASE),
-        "checkMesh reported failed mesh checks",
-    ),
-)
-_FOAM_END_RE = re.compile(r"^\s*End\s*$", re.MULTILINE)
-
-
-def _read_foam_log(directory: str, file_name: str) -> tuple[str | None, dict | None]:
-    filepath = os.path.join(directory, file_name)
-    try:
-        with open(filepath, encoding="utf-8") as log_file:
-            return log_file.read(), None
-    except OSError:
-        return None, {"file": file_name, "error_content": f"Could not read log file: {filepath}"}
-
-
-def _foam_log_failure(file_name: str, content: str) -> dict | None:
-    """Return an explicit or semantic OpenFOAM error found in one log."""
-    for pattern, reason in _SEMANTIC_FOAM_FAILURES:
-        match = pattern.search(content)
-        if match:
-            line = content[match.start() :].splitlines()[0].strip()
-            return {
-                "file": file_name,
-                "error_content": f"Semantic simulation failure: {reason}. OpenFOAM reported: {line}",
-            }
-    match = _EXPLICIT_FOAM_ERROR_RE.search(content)
-    if match:
-        return {"file": file_name, "error_content": match.group(0).strip()}
-    return None
-
-
-def _unfinished_foam_log(file_name: str, content: str) -> dict | None:
-    if _FOAM_END_RE.search(content):
-        return None
-    last_lines = "\n".join(content.strip().split("\n")[-30:])
-    return {
-        "file": file_name,
-        "error_content": (
-            "Solver did not complete (no 'End' marker found). "
-            f"Last 30 lines:\n{last_lines}"
-        ),
-    }
 
 
 def check_foam_errors(directory: str) -> list:
-    """Check OpenFOAM log files for errors.
-
-    Tier 1 (existing): Match explicit ``ERROR:`` lines.
-    Tier 2 (safety-net): If no explicit error is found, verify that **every**
-    log file contains the ``End`` marker that OpenFOAM prints on successful
-    completion.  Any log missing ``End`` is reported with the last 30 lines
-    as error context so the caller can diagnose the crash.
-    """
+    """Collect explicit OpenFOAM errors without imposing completion heuristics."""
     error_logs: list[dict] = []
-    log_contents: dict[str, str] = {}
     for file_name in os.listdir(directory):
         if not file_name.startswith("log"):
             continue
-        content, read_error = _read_foam_log(directory, file_name)
-        if read_error:
-            error_logs.append(read_error)
+        filepath = os.path.join(directory, file_name)
+        try:
+            with open(filepath, encoding="utf-8") as log_file:
+                content = log_file.read()
+        except OSError:
+            error_logs.append(
+                {
+                    "file": file_name,
+                    "error_content": f"Could not read log file: {filepath}",
+                }
+            )
             continue
-        if content is None:
-            continue
-        log_contents[file_name] = content
-        failure = _foam_log_failure(file_name, content)
-        if failure:
-            error_logs.append(failure)
-    if error_logs or not log_contents:
-        return error_logs
-    return [
-        failure
-        for file_name, content in log_contents.items()
-        if (failure := _unfinished_foam_log(file_name, content)) is not None
-    ]
-
-def extract_commands_from_allrun_out(out_file: str) -> list:
-    commands = []
-    if not os.path.exists(out_file):
-        return commands
-    with open(out_file, 'r') as f:
-        for line in f:
-            if line.startswith("Running "):
-                parts = line.split(" ")
-                if len(parts) > 1:
-                    commands.append(parts[1].strip())
-    return commands
-
-def parse_case_name(text: str) -> str:
-    match = re.search(r'case name:\s*(.+)', text, re.IGNORECASE)
-    return match.group(1).strip() if match else "default_case"
-
-def split_subtasks(text: str) -> list:
-    header_match = re.search(r'splits into (\d+) subtasks:', text, re.IGNORECASE)
-    if not header_match:
-        print("Warning: No subtasks header found in the response.")
-        return []
-    num_subtasks = int(header_match.group(1))
-    subtasks = re.findall(r'subtask\d+:\s*(.*)', text, re.IGNORECASE)
-    if len(subtasks) != num_subtasks:
-        print(f"Warning: Expected {num_subtasks} subtasks but found {len(subtasks)}.")
-    return subtasks
+        match = _EXPLICIT_FOAM_ERROR_RE.search(content)
+        if match:
+            error_logs.append(
+                {"file": file_name, "error_content": match.group(0).strip()}
+            )
+    return error_logs
 
 def parse_context(text: str) -> str:
     match = re.search(r'FoamFile\s*\{.*?(?=```|$)', text, re.DOTALL | re.IGNORECASE)
@@ -1407,39 +1297,6 @@ def parse_context(text: str) -> str:
     
     print("Warning: Could not parse context; returning original text.")
     return text
-
-
-def parse_file_name(subtask: str) -> str:
-    match = re.search(r'openfoam\s+(.*?)\s+foamfile', subtask, re.IGNORECASE)
-    return match.group(1).strip() if match else ""
-
-def parse_folder_name(subtask: str) -> str:
-    match = re.search(r'foamfile in\s+(.*?)\s+folder', subtask, re.IGNORECASE)
-    return match.group(1).strip() if match else ""
-
-def find_similar_file(description: str, tutorial: str) -> str:
-    start_pos = tutorial.find(description)
-    if start_pos == -1:
-        return "None"
-    end_marker = "input_file_end."
-    end_pos = tutorial.find(end_marker, start_pos)
-    if end_pos == -1:
-        return "None"
-    return tutorial[start_pos:end_pos + len(end_marker)]
-
-def read_commands(file_path: str) -> str:
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Commands file not found: {file_path}")
-    with open(file_path, 'r') as f:
-        # join non-empty lines with a comma
-        return ", ".join(line.strip() for line in f if line.strip())
-
-def find_input_file(case_dir: str, command: str) -> str:
-    for root, _, files in os.walk(case_dir):
-        for file in files:
-            if command in file:
-                return os.path.join(root, file)
-    return ""
 
 def retrieve_faiss(
     database_name: str,
@@ -1554,3 +1411,38 @@ def parse_directory_structure(data: str) -> dict:
             directory_file_counts[dir_name] = len(file_list)
 
     return directory_file_counts
+
+
+def load_case_files(state: dict[str, Any]) -> dict[str, Any]:
+    """Read the shared file state on import or mesh changes."""
+    case_dir = state.get("case_dir")
+    if not case_dir:
+        return {}
+    directory = scan_case_directory(case_dir)
+    input_directory = _case_input_directory(directory)
+    foamfiles = read_case_foamfiles(case_dir, input_directory)
+    return {
+        "dir_structure": directory,
+        "foamfiles": foamfiles,
+    }
+
+
+def _case_input_directory(directory: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Keep LLM context focused on dictionaries and the active field directory."""
+    selected = {
+        name: files
+        for name, files in directory.items()
+        if name in {"system", "constant", "0", "0.0"}
+    }
+    if "0" in selected or "0.0" in selected:
+        return selected
+    numeric: list[tuple[float, str]] = []
+    for name in directory:
+        try:
+            numeric.append((float(name), name))
+        except ValueError:
+            continue
+    if numeric:
+        latest_name = max(numeric)[1]
+        selected[latest_name] = directory[latest_name]
+    return selected

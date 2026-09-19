@@ -300,9 +300,6 @@ dependencies:
   - zlib=1.3.1
   - zstd=1.5.7
   - pip:
-      # The Conda dependencies above already provide the locked CUDA runtime.
-      # The Docker build installs this exported pip list without resolving the
-      # same NVIDIA wheels a second time from PyPI.
       - accelerate==1.2.1
       - aiohappyeyeballs==2.4.6
       - aiohttp==3.11.12

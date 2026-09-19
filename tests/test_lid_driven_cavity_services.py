@@ -16,18 +16,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from services.plan import (
     parse_requirement_to_case_info,
     resolve_case_dir,
-    retrieve_references,
     generate_simulation_plan
 )
 from services.input_writer import initial_write
 from services.mesh import prepare_standard_mesh
 from services.run_local import run_allrun_and_collect_errors
 from services.review import review_error_logs
-from services.visualization import (
-    ensure_foam_file,
-    generate_pyvista_script,
-    run_pyvista_script
-)
+from services.visualization import visualize_case
 from config import Config
 from openfoam_target import database_path_for_config
 
@@ -139,7 +134,7 @@ def main():
         print("\n🕸️ Step 4: Preparing mesh")
         print("-" * 40)
         
-        prepare_standard_mesh(user_requirement, case_dir)
+        prepare_standard_mesh()
         
         mesh_dir = os.path.join(case_dir, 'constant', 'polyMesh')
         if os.path.exists(mesh_dir):
@@ -206,20 +201,14 @@ def main():
         print("\n📊 Step 7: Generating visualization")
         print("-" * 40)
         
-        foam_file = ensure_foam_file(case_dir)
-        script = generate_pyvista_script(
-            case_dir=case_dir,
-            foam_file=foam_file,
-            user_requirement="velocity field",
-            previous_errors=[]
-        )
-        
-        ok, img, errs = run_pyvista_script(case_dir, script)
-        
-        if ok and img:
-            print(f"✅ Generated visualization: {img}")
+        visualization = visualize_case(case_dir, "velocity field")
+        ok = visualization["pyvista_visualization"]["success"]
+        images = visualization["pyvista_visualization"].get("output_images", [])
+
+        if ok and images:
+            print(f"✅ Generated visualization: {images[0]}")
         else:
-            print(f"⚠️ Visualization issues: {errs}")
+            print(f"⚠️ Visualization issues: {visualization['pyvista_visualization'].get('error_logs', [])}")
         results['visualization'] = ok
         
         # Summary

@@ -2,13 +2,11 @@ from typing import Optional
 from langgraph.graph import StateGraph, START, END
 import argparse
 from pathlib import Path
-from utils import LLMService, GraphState
+from utils import GraphState, load_agent_resources
 
 from config import Config
 from openfoam_target import (
-    database_path_for_config,
     normalise_openfoam_target,
-    require_target_corpus,
 )
 from nodes.planner_node import planner_node
 from nodes.meshing_node import meshing_node
@@ -28,17 +26,13 @@ from router_func import (
     route_workflow_entry,
 )
 from logger import close_logging
-import json
-
-
-def workflow_entry_node(_state: GraphState) -> dict:
-    """Provide one graph entry point before routing by input mode."""
-    return {}
+from services.plan import DEFAULT_IMPORTED_REQUIREMENT
 
 
 def workflow_exit_code(state: GraphState) -> int:
     """Return a non-zero process status for any terminal workflow failure."""
-    return 2 if state.get("termination_reason") else 0
+    status = state.get("workflow_status")
+    return 2 if status in {"failed", "partial_success"} or state.get("termination_reason") else 0
 
 
 def create_foam_agent_graph() -> StateGraph:
@@ -48,7 +42,6 @@ def create_foam_agent_graph() -> StateGraph:
     workflow = StateGraph(GraphState)
     
     # Add nodes
-    workflow.add_node("entry", workflow_entry_node)
     workflow.add_node("planner", planner_node)
     workflow.add_node("meshing", meshing_node)
     workflow.add_node("input_writer", input_writer_node)
@@ -59,8 +52,7 @@ def create_foam_agent_graph() -> StateGraph:
     workflow.add_node("case_import", case_import_node)
     
     # Add edges
-    workflow.add_edge(START, "entry")
-    workflow.add_conditional_edges("entry", route_workflow_entry)
+    workflow.add_conditional_edges(START, route_workflow_entry)
     workflow.add_conditional_edges("planner", route_after_planner)
     workflow.add_conditional_edges("meshing", route_after_meshing)
     workflow.add_conditional_edges("input_writer", route_after_input_writer)
@@ -81,31 +73,20 @@ def initialize_state(
     case_import_path: Optional[str] = None,
     case_import_subdir: Optional[str] = None,
     requires_visualization: Optional[bool] = None,
+    user_requirement_explicit: bool = True,
 ) -> GraphState:
-    """Build the state for either prompt generation or controlled case import.
-
-    Import mode intentionally avoids loading RAG metadata or constructing an
-    LLM client: neither is needed to execute a user-provided case safely.
-    """
+    """Build state for generated or imported agent workflows."""
     case_stats = None
     llm_service = None
     if workflow_mode == "prompt":
-        require_target_corpus(config)
-        case_stats_path = database_path_for_config(config) / "raw" / "openfoam_case_stats.json"
-        with case_stats_path.open(encoding="utf-8") as case_stats_file:
-            case_stats = json.load(case_stats_file)
-        llm_service = LLMService(config)
+        llm_service, case_stats = load_agent_resources(config)
     # mesh_type = "custom_mesh" if custom_mesh_path else "standard_mesh"
     state = GraphState(
         user_requirement=user_requirement,
         config=config,
         case_dir="",
-        tutorial="",
         case_name="",
         subtasks=[],
-        current_subtask_index=0,
-        error_command=None,
-        error_content=None,
         loop_count=0,
         llm_service=llm_service,
         case_stats=case_stats,
@@ -137,24 +118,18 @@ def initialize_state(
         slurm_script_path=None,
         termination_reason=None,
         workflow_mode=workflow_mode,
-        # These policies make the common execution/review nodes explicit about
-        # what they may do.  ``workflow_mode`` remains the entry router's
-        # concern; downstream nodes use policy, not the input transport.
-        execution_policy=(
-            "generated_allrun" if workflow_mode == "prompt" else "controlled_import"
-        ),
-        repair_policy=(
-            "llm_rewrite" if workflow_mode == "prompt" else "numeric_invariant_only"
-        ),
+        case_origin="generated" if workflow_mode == "prompt" else "imported",
+        user_requirement_explicit=user_requirement_explicit,
         case_import_path=case_import_path,
         case_import_subdir=case_import_subdir,
         case_import_manifest=None,
-        case_import_original_dir=None,
         case_import_report_dir=None,
-        case_import_attempts=[],
-        case_import_overrides={},
-        case_import_error_fingerprints=[],
-        case_import_status=None,
+        case_context=None,
+        workflow_status="planning",
+        error_fingerprints=[],
+        target_mismatch=False,
+        requires_meshing=False,
+        requires_input_writer=False,
     )
     if custom_mesh_path:
         print(f"<custom_mesh_path>{custom_mesh_path}</custom_mesh_path>")
@@ -162,27 +137,42 @@ def initialize_state(
         print("<custom_mesh_path>None</custom_mesh_path>")
     return state
 
-def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] = None) -> GraphState:
-    """Main function to run the OpenFOAM workflow."""
-    
-    # Create and compile the graph
-    workflow = create_foam_agent_graph()
-    app = workflow.compile()
-    
-    # Initialize the state
-    initial_state = initialize_state(user_requirement, config, custom_mesh_path)
-    
-    print("<workflow_start>Starting Foam-Agent...</workflow_start>")
-
-    # Invoke the graph
+def main(
+    user_requirement: str,
+    config: Config,
+    custom_mesh_path: Optional[str] = None,
+    *,
+    case_path: Optional[str] = None,
+    case_subdir: Optional[str] = None,
+) -> GraphState:
+    """Run the shared workflow for a prompt or an existing case."""
+    if case_path and not config.case_dir:
+        raise ValueError("--output_dir is required when --case_path is used.")
     try:
-        # Every graph node passes this invocation's LLM service explicitly to
-        # its service-layer operation.  This keeps concurrent configurations
-        # isolated instead of relying on mutable process-wide state.
+        # Create and compile the graph
+        workflow = create_foam_agent_graph()
+        app = workflow.compile()
+
+        # Initialize the state
+        initial_state = initialize_state(
+            (user_requirement.strip() or DEFAULT_IMPORTED_REQUIREMENT) if case_path else user_requirement,
+            config,
+            custom_mesh_path,
+            workflow_mode="imported_case" if case_path else "prompt",
+            case_import_path=case_path,
+            case_import_subdir=case_subdir,
+            user_requirement_explicit=bool(user_requirement.strip() or custom_mesh_path) if case_path else True,
+        )
+
+        print("<workflow_start>Starting Foam-Agent...</workflow_start>")
+
+        # Invoke the graph
         result = app.invoke(initial_state, config={"recursion_limit": config.recursion_limit})
 
         termination_reason = result.get("termination_reason")
-        if termination_reason:
+        if result.get("workflow_status") == "partial_success":
+            print("<workflow_end>Simulation completed successfully, but visualization failed.</workflow_end>")
+        elif termination_reason:
             print(
                 "<workflow_end>Workflow stopped without completing successfully: "
                 f"{termination_reason}</workflow_end>"
@@ -203,78 +193,25 @@ def main(user_requirement: str, config: Config, custom_mesh_path: Optional[str] 
         close_logging()
 
 
-def main_imported_case(
-    case_path: str,
-    config: Config,
-    *,
-    case_subdir: Optional[str] = None,
-    visualize: bool = False,
-) -> dict:
-    """Run an existing case through the protected branch of the StateGraph.
-
-    The branch omits Planner, Meshing, Input Writer, and the LLM reviewer so
-    user dictionaries cannot be regenerated or numerically modified.
-    """
-
-    if not config.case_dir:
-        raise ValueError("--output_dir is required when --case_path is used.")
-    try:
-        workflow = create_foam_agent_graph()
-        app = workflow.compile()
-        initial_state = initialize_state(
-            "Run the supplied OpenFOAM case without changing user-provided numeric inputs.",
-            config,
-            workflow_mode="imported_case",
-            case_import_path=case_path,
-            case_import_subdir=case_subdir,
-            requires_visualization=visualize,
-        )
-        print("<workflow_start>Starting imported-case Foam-Agent workflow...</workflow_start>")
-        final_state = app.invoke(
-            initial_state,
-            config={"recursion_limit": config.recursion_limit},
-        )
-        manifest = final_state.get("case_import_manifest")
-        errors = final_state.get("error_logs") or []
-        result = {
-            "status": final_state.get("case_import_status", "blocked"),
-            "original_dir": final_state.get("case_import_original_dir"),
-            "work_dir": final_state.get("case_dir"),
-            "report_dir": final_state.get("case_import_report_dir"),
-            "manifest": manifest.to_dict() if manifest is not None else None,
-            "attempts": final_state.get("case_import_attempts") or [],
-            "errors": errors,
-        }
-        summary = {
-            "status": result["status"],
-            "work_dir": result["work_dir"],
-            "report_dir": result["report_dir"],
-            "attempt_count": len(result["attempts"]),
-        }
-        print(f"<case_import_result>{json.dumps(summary)}</case_import_result>")
-        return result
-    finally:
-        close_logging()
-
 if __name__ == "__main__":
     # python main.py
     parser = argparse.ArgumentParser(
         description="Run the OpenFOAM workflow"
     )
-    input_group = parser.add_mutually_exclusive_group()
-    input_group.add_argument(
+    parser.add_argument(
         "--prompt_path",
         type=str,
         default=None,
         help="User requirement file path for the workflow.",
     )
-    input_group.add_argument(
+    parser.add_argument(
         "--case_path",
         type=str,
         default=None,
         help=(
-            "Existing OpenFOAM case directory or ZIP archive. This defaults to "
-            "Foundation v10; use --openfoam_target esi-v2006 for ESI v2006."
+            "Existing OpenFOAM case directory or ZIP archive. Uses the explicitly "
+            "configured target; otherwise attempts to detect Foundation v10 or ESI "
+            "v2006 from case headers. Specify --openfoam_target if detection is inconclusive."
         ),
     )
     parser.add_argument(
@@ -305,7 +242,7 @@ if __name__ == "__main__":
         "--custom_mesh_path",
         type=str,
         default=None,
-        help="Path to custom mesh file (e.g., .msh, .stl, .obj). If not provided, no custom mesh will be used.",
+        help="Path to a Gmsh .msh file (ASCII 2.2 format). If not provided, no custom mesh will be used.",
     )
     parser.add_argument(
         "--reuse_generated_dir",
@@ -320,11 +257,6 @@ if __name__ == "__main__":
         "--overwrite_output",
         action="store_true",
         help="Explicitly allow replacing an existing non-empty output directory.",
-    )
-    parser.add_argument(
-        "--visualize",
-        action="store_true",
-        help="Generate a PyVista visualization after a successful imported case run.",
     )
     
     args = parser.parse_args()
@@ -347,33 +279,32 @@ if __name__ == "__main__":
 
     if args.reuse_generated_dir:
         config.reuse_generated_dir = args.reuse_generated_dir
-
-    config.overwrite_case_dir = args.overwrite_output
     
+    config.overwrite_case_dir = args.overwrite_output
+
     if args.case_path:
-        if args.custom_mesh_path:
-            parser.error("--custom_mesh_path is not available with --case_path.")
         if args.reuse_generated_dir:
             parser.error("--reuse_generated_dir is not available with --case_path.")
         if not args.output_dir:
             parser.error("--output_dir is required with --case_path.")
-        imported_result = main_imported_case(
-            args.case_path,
-            config,
-            case_subdir=args.case_subdir,
-            visualize=args.visualize,
+        user_requirement = (
+            Path(args.prompt_path).read_text(encoding="utf-8")
+            if args.prompt_path
+            else ""
         )
-        if imported_result.get("status") != "success":
-            raise SystemExit(2)
     else:
         if args.case_subdir:
             parser.error("--case_subdir requires --case_path.")
-        if args.visualize:
-            parser.error("--visualize requires --case_path.")
         prompt_path = args.prompt_path or f"{Path(__file__).parent.parent}/user_requirement.txt"
-        with open(prompt_path, 'r') as f:
+        with open(prompt_path, 'r', encoding="utf-8") as f:
             user_requirement = f.read()
-
-        final_state = main(user_requirement, config, args.custom_mesh_path)
-        if exit_code := workflow_exit_code(final_state):
-            raise SystemExit(exit_code)
+    
+    final_state = main(
+        user_requirement,
+        config,
+        args.custom_mesh_path,
+        case_path=args.case_path,
+        case_subdir=args.case_subdir,
+    )
+    if exit_code := workflow_exit_code(final_state):
+        raise SystemExit(exit_code)

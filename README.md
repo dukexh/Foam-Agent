@@ -7,13 +7,13 @@
     <em>An End-to-End Composable Multi-Agent Framework for Automating CFD Simulation in OpenFOAM</em>
 </p>
 
-**Foam-Agent** automates the entire **OpenFOAM**-based CFD simulation workflow from a single natural language prompt. It manages meshing, case setup, execution, error correction, and post-processing — dramatically lowering the expertise barrier for Computational Fluid Dynamics. Evaluated on [FoamBench](https://arxiv.org/abs/2509.20374) with 110 simulation tasks, our framework achieves an **100% success rate** with Claude Opus 4.6.
+**Foam-Agent** automates the **OpenFOAM**-based CFD simulation workflow from a natural language prompt or an existing case. It manages meshing, case setup, execution, error correction, and optional post-processing. The project's reported [FoamBench](https://arxiv.org/abs/2509.20374) evaluation covers 110 simulation tasks and records a **100% success rate** with Claude Opus 4.6; this is a benchmark result, not a guarantee for arbitrary cases.
 
 Visit [deepwiki.com/csml-rpi/Foam-Agent](https://deepwiki.com/csml-rpi/Foam-Agent) for a comprehensive introduction and to ask questions interactively.
 
 ## Key Features
 
-- **End-to-End Automation**: From meshing (including external Gmsh `.msh` files) to HPC job submission to ParaView/PyVista visualization — one prompt does it all.
+- **End-to-End Workflow**: Meshing (including external Gmsh `.msh` files), case generation, local execution or Slurm submission, and optional PyVista visualization. Execution requires the corresponding runtime and infrastructure.
 - **Multi-Agent Workflow**: Architect, Input Writer, Runner, and Reviewer agents collaborate through a LangGraph pipeline with automatic error correction (up to 25 iterations).
 - **RAG-Enhanced Generation**: Hierarchical FAISS indices built from OpenFOAM tutorials provide context-specific retrieval for accurate configuration file generation.
 - **Composable Service Architecture**: Core functions are exposed as MCP tools, enabling integration with Claude Code, Cursor, and other agentic systems.
@@ -24,6 +24,8 @@ Visit [deepwiki.com/csml-rpi/Foam-Agent](https://deepwiki.com/csml-rpi/Foam-Agen
 
 ```bash
 docker run -it \
+  -e FOAMAGENT_MODEL_PROVIDER=openai \
+  -e FOAMAGENT_MODEL_VERSION=gpt-5-mini \
   -e OPENAI_API_KEY=your-key-here \
   -p 7860:7860 \
   --name foamagent \
@@ -56,16 +58,25 @@ That's it. Foam-Agent will plan the case, generate all OpenFOAM files, run the s
 
 ### 4. Run an Existing Case
 
-An existing case can be supplied instead of a natural-language prompt. This mode does not invoke Planner, Meshing, or Input Writer. Instead it enters the workflow's protected existing-case branch (`case_import` → shared local runner with a controlled-import policy → shared reviewer with a deterministic safe-repair policy), preserving the uploaded dictionaries and running a validated, controlled equivalent of its `Allrun`.
+An existing directory or ZIP is another Foam-Agent input. `case_import` preserves a read-only `original/` copy, creates a writable `work/` copy, and passes the discovered files, solver, mesh, time directories, and results to the normal Planner. Platform detection uses OpenFOAM header evidence, not dictionary filenames alone; specify `--openfoam_target` when the platform cannot be resolved. A case with `Allrun`, no detected issues, and no explicit prompt or custom mesh skips file planning and routes to Runner. This still requires LLM resources and routing calls. Other cases use LLM planning to select file changes or meshing, or fail when required physical information cannot be inferred. A configured target conflicting with the detected platform is recorded deterministically, then routed from Planner to Reviewer/Input Writer for repair; the Planner LLM does not decide whether the mismatch exists.
+
+The local runner uses the same cleanup policy for generated and imported cases. Prior run artifacts and nonzero time directories in `work/` are cleared before execution and are not automatically restored after failure. The `original/` copy remains available; the local workflow does not preserve restart data for continuation runs. HPC execution instead follows the generated Slurm script and the case's `Allrun`.
 
 ```bash
+# Preserve the existing physical definition and run it
 python foambench_main.py \
   --output ./output/imported-dam-break \
-  --case_path /path/to/damBreak \
-  --visualize
+  --case_path /path/to/damBreak
+
+# Modify an existing case according to a prompt, then run it
+python foambench_main.py \
+  --output ./output/modified-case \
+  --case_path /path/to/case \
+  --prompt_path ./requirements.txt \
+  --openfoam_target esi-v2006
 ```
 
-`--visualize` is optional. When supplied, a successful imported case uses the same read-only PyVista visualization node as a prompt-generated case.
+Request visualization in the prompt for either generated or imported cases; the Planner determines whether it is needed. `--custom_mesh_path` can be combined with `--case_path` and `--prompt_path`; the Planner then decides whether Meshing must run before targeted dictionary changes and execution.
 
 `--case_path` accepts either a case directory or a ZIP archive. If an archive contains multiple cases, select one explicitly:
 
@@ -76,25 +87,31 @@ python foambench_main.py \
   --case_subdir multiphase/interFoam/laminar/damBreak/damBreak
 ```
 
-The output directory contains `original/` (a hashed source copy with read-only files), `work/` (the only directory executed or repaired), and `report/` (the manifest, attempt history, and any diffs). User-provided numeric tokens are never changed automatically. The importer only permits a small set of Foundation v10 utilities/solver commands; custom compilation, dynamic code, ESI cases, and unsafe shell setup are reported as blockers rather than executed. If `Allrun` is absent, Foam-Agent can infer only the minimal `blockMesh`/`checkMesh`/solver plan for a case that already provides enough files.
+The task directory contains `original/`, `work/`, and `report/`. `report/case_context.json` records the initial imported context, and `report/logs/` contains workflow logs; local `Allrun.out`, `Allrun.err`, and solver logs remain in `work/`. Existing `Allrun` is executed from `work/` unless the repair workflow changes it. Import rejects symbolic links in a source case. Replacing a non-empty output directory requires both Foam-Agent's ownership marker and `--overwrite_output` (or the API's `overwrite_output=true`). Import itself does not impose a command whitelist or rewrite the script.
+
+Generated and imported cases use the same Reviewer → Input Writer → Runner repair loop, with analysis history and the configured retry limit. Meshing failures also enter Reviewer: a file-scoped repair passes through Input Writer and returns to Meshing; without target files, it retries Meshing directly. Successful mesh repair resumes the pending workflow. Reviewer records error fingerprints and stops when consecutive fingerprints of the errors, filtered case files, and user requirement are identical. The graph recursion limit also bounds execution. There is no interactive clarification or task-resume step. If import planning cannot proceed, correct the inputs indicated by the failure reason and start a new run.
+
+If simulation succeeds but requested visualization fails, the workflow reports `partial_success`, `termination_reason=visualization_failed`, and `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` returns the message and `visualization_error` separately from execution errors.
 
 ## Configuration
 
-All settings live in `src/config.py` with sensible defaults. Every setting can be overridden via environment variables — no need to edit files, especially useful for Docker and CI.
+Settings live in `src/config.py` with sensible defaults. The supported environment variables below override model, embedding, OpenFOAM fork, and native target selection, which is useful for Docker and CI. Other configuration fields use their Python defaults or explicit CLI/API values.
 
 ### LLM Provider and Model
 
 | Environment Variable | Purpose | Allowed Values |
 |---|---|---|
-| `FOAMAGENT_MODEL_PROVIDER` | LLM backend | `openai`, `openai-codex`, `anthropic`, `bedrock`, `ollama` |
-| `FOAMAGENT_MODEL_VERSION` | Model identifier | e.g., `gpt-5-mini`, `gpt-5.6-terra`, `claude-opus-4-6` |
+| `FOAMAGENT_MODEL_PROVIDER` | LLM backend | `openai`, `openai-codex`, `anthropic`, `bedrock`, `ollama`, `deepseek` |
+| `FOAMAGENT_MODEL_VERSION` | Model identifier | A model supported by the selected provider; default `gpt-5.3-codex` |
+
+The default provider is `openai-codex`, which reads an OAuth token cache. Setting `OPENAI_API_KEY` alone does not switch to the `openai` provider; set both provider and model for API-key usage.
 
 Example:
 ```bash
 docker run -it \
   -e FOAMAGENT_MODEL_PROVIDER=anthropic \
   -e ANTHROPIC_API_KEY=your-key-here \
-  -e FOAMAGENT_MODEL_VERSION=claude-opus-4-6 \
+  -e FOAMAGENT_MODEL_VERSION=claude-sonnet-4-6 \
   -p 7860:7860 \
   leoyue123/foamagent
 ```
@@ -114,6 +131,7 @@ Defaults to `huggingface` with `Qwen/Qwen3-Embedding-0.6B` (runs locally, no API
 |---|---|
 | `OPENAI_API_KEY` | Using `openai` provider |
 | `ANTHROPIC_API_KEY` | Using `anthropic` provider |
+| `DEEPSEEK_API_KEY` | Using `deepseek` provider |
 | AWS credentials | Using `bedrock` provider |
 
 ### Input Writer Generation Mode
@@ -125,7 +143,9 @@ Set in `src/config.py` via `input_writer_generation_mode`:
 | `sequential_dependency` | Files generated in order with cross-file context | Expensive runs (HPC, long simulations) |
 | `parallel_no_context` | Files generated in parallel, no cross-file context | Fast local runs where retry is cheap |
 
-### Recommended Models
+### Reported Benchmark Results
+
+These are the project's recorded benchmark results, not guarantees for the current working tree, native ESI v2006, or arbitrary imported cases.
 
 | Framework | Model | Basic | Advanced |
 |---|---|---:|---:|
@@ -136,7 +156,7 @@ Set in `src/config.py` via `input_writer_generation_mode`:
 | FoamAgent 2.0.0 (25 loops) | gpt-5.4 | 45.45% | 75.00% |
 | FoamAgent 2.0.0 (25 loops) | gpt-5.3-codex | 54.55% | 62.50% |
 
-We recommend **Anthropic Claude Opus 4.6** for best results.
+The highest reported scores in this table use **Anthropic Claude Opus 4.6**; model selection remains configurable.
 
 ## Advanced Usage
 
@@ -155,6 +175,8 @@ To mount a mesh file from the host into Docker:
 
 ```bash
 docker run -it \
+  -e FOAMAGENT_MODEL_PROVIDER=openai \
+  -e FOAMAGENT_MODEL_VERSION=gpt-5-mini \
   -e OPENAI_API_KEY=your-key-here \
   -v /path/to/my_mesh.msh:/home/openfoam/Foam-Agent/my_mesh.msh \
   -p 7860:7860 \
@@ -195,6 +217,8 @@ If running in Docker, start the HTTP server and point your MCP client at it:
 
 ```bash
 docker run -it \
+  -e FOAMAGENT_MODEL_PROVIDER=openai \
+  -e FOAMAGENT_MODEL_VERSION=gpt-5-mini \
   -e OPENAI_API_KEY=your-key-here \
   -p 7860:7860 \
   leoyue123/foamagent \
@@ -224,8 +248,8 @@ Foundation OpenFOAM v10 is the default native target. Set
 
 ### Native target capability parity
 
-`foundation-v10` and `esi-v2006` are peer native targets. Both support prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, controlled case import, and target-specific Docker delivery. Their solver names and dictionary syntax remain release-native. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
-mode and is not a third native target.
+`foundation-v10` and `esi-v2006` use the same workflow implementation for prompt planning and RAG, file and Allrun generation, standard/Gmsh/custom meshes, local and HPC execution, review/rewrite, visualization, and existing-case import, with target-specific Docker delivery. This is shared code coverage, not a guarantee that every solver or case succeeds. Their solver names and dictionary syntax remain release-native. Existing cases use conditional graph routes: Planner selects optional mesh preparation and file modification before running; Reviewer supplies file repair plans or mesh retries. `FOAMAGENT_OPENFOAM_FORK=esi` is a legacy translation
+mode.
 
 Native tutorial corpora are stored by target under `database/`: Foundation v10 uses `database/foundation-v10/{raw,faiss}`, while ESI/OpenCFD v2006 uses `database/esi-v2006/{raw,faiss}`. The sibling `database/script/` directory contains the parsers and FAISS builders shared by both corpora.
 
@@ -236,6 +260,7 @@ Native tutorial corpora are stored by target under `database/`: Foundation v10 u
 | `run` | Execute Allrun locally with error collection and validate the selected native runtime |
 | `review` | Analyze simulation errors and suggest fixes using the selected native target's references |
 | `apply_fixes` | Rewrite OpenFOAM files according to the selected native conventions |
+| `run_case` | Run or modify an existing directory/ZIP through the complete Planner-to-Reviewer workflow |
 | `visualization` | Generate PyVista visualization of simulation results |
 
 #### Claude Code Skill
@@ -247,6 +272,8 @@ For Claude Code users who clone this repo, a `/foam` skill is included in `.clau
 ```
 
 This triggers the full pipeline: plan -> generate files -> run -> review/fix loop -> visualize.
+
+This skill orchestrates individual MCP tools on the client, with up to five repair iterations and optional visualization. Those tools do not run the CLI's complete graph automatically; the standalone `run` tool is local-only. Use the CLI graph for generated-case Gmsh/custom-mesh or HPC routing, and `run_case` for the imported-case graph.
 
 ### Codex OAuth Sign-in (No API Key)
 
@@ -260,7 +287,7 @@ If you have a ChatGPT/Codex subscription, you can authenticate via OAuth instead
 ```bash
 docker run -it \
   -e FOAMAGENT_MODEL_PROVIDER=openai-codex \
-  -e FOAMAGENT_MODEL_VERSION=gpt-5.6-terra \
+  -e FOAMAGENT_MODEL_VERSION=gpt-5.3-codex \
   -v ~/.codex/auth.json:/root/.codex/auth.json:ro \
   -p 7860:7860 \
   leoyue123/foamagent
@@ -301,28 +328,40 @@ Build the isolated ESI v2006 corpus from an ESI v2006 installation, then select 
 ```bash
 # Maintainers: rebuild the versioned v2006 corpus from a sourced ESI/OpenCFD
 # v2006 installation. Regular users receive this corpus through Git LFS.
-python scripts/build_target_corpus.py --openfoam-path "$WM_PROJECT_DIR" --force
+python init_database.py --openfoam_target esi-v2006 \
+  --openfoam_path "$WM_PROJECT_DIR" \
+  --embedding_provider huggingface --embedding_model Qwen/Qwen3-Embedding-0.6B --force
 # If a packaged v2006 runtime omits tutorials, point at tutorials extracted
 # from the matching official OpenFOAM-v2006 source archive:
-#   --tutorials-path /path/to/OpenFOAM-v2006/tutorials
+#   --tutorials_path /path/to/OpenFOAM-v2006/tutorials
 
 # Users: clone with Git LFS, then run the selected native target.
 git lfs pull
 python foambench_main.py --openfoam_target esi-v2006 \
-  --openfoam_path "$WM_PROJECT_DIR" \
   --output ./output/esi-v2006 --prompt_path ./user_requirement.txt
 ```
 
-`WM_PROJECT_VERSION` must report `v2006` (or `2006`) at execution time. The corpus builder's OpenAI index requires `OPENAI_API_KEY`; use
-`FOAMAGENT_ESI_V2006_DATABASE_PATH` only when the v2006 corpus lives outside the default `database/esi-v2006/` directory. Native HPC jobs additionally require `FOAMAGENT_HPC_OPENFOAM_BASHRC` to point to the trusted v2006 `etc/bashrc` on the compute nodes.
+The explicit embedding arguments above build Qwen3-Embedding-0.6B indices, matching the runtime default. Without those arguments, `init_database.py` checks completeness under Qwen 0.6B, but invokes FAISS builders whose defaults are OpenAI/`text-embedding-3-small`. Always supply both arguments; the runtime embedding environment variables do not set the builders' CLI defaults. Omit `--force` to reuse existing raw data and complete selected-model indices. Use `--embedding_provider huggingface --embedding_model Qwen/Qwen3-Embedding-8B` for 8B, or `--embedding_provider openai --embedding_model text-embedding-3-small` for OpenAI. Set the corresponding runtime embedding provider/model when using those indices.
+
+The current Foundation corpus has Qwen 0.6B, Qwen 8B, and OpenAI small index directories; the ESI v2006 corpus has Qwen 0.6B and OpenAI small, but no prebuilt Qwen 8B directory. `init_database.py --database_path` takes a target-specific directory; `Config.database_path` instead takes the parent containing both target directories.
+
+`WM_PROJECT_VERSION` must report `v2006` (or `2006`) at execution time. Building the OpenAI index requires `OPENAI_API_KEY`. Both targets use their own subdirectory under the configured database root and check the corpus manifest, required raw files, and selected embedding indices before loading. HPC jobs use the existing OpenFOAM environment on the compute nodes and check that its version matches the selected target.
+
+### HPC execution and monitoring
+
+The HPC node generates a Slurm script and invokes `sbatch` and `squeue` in the agent's environment. The case path must be accessible to the compute nodes; this code does not upload files or establish an SSH connection. The selected OpenFOAM environment must already be available when the job's runtime guard executes.
+
+Current monitoring treats an empty `squeue` response as `COMPLETED`, then checks case logs. It does not query `sacct` or validate a Slurm exit code. The wait defaults to 3600 seconds with 30-second polling; timeout returns the last observed state, which may enter the existing Reviewer/repair/resubmission loop even while the original job remains active. Job disappearance is therefore not independent confirmation of successful execution.
 
 ### Building the Docker Image from Source
 
 ```bash
 git clone https://github.com/csml-rpi/Foam-Agent.git
 cd Foam-Agent
-python scripts/build_docker_image.py
+docker build -f docker/Dockerfile -t foamagent:foundation-v10 .
 docker run -it \
+  -e FOAMAGENT_MODEL_PROVIDER=openai \
+  -e FOAMAGENT_MODEL_VERSION=gpt-5-mini \
   -e OPENAI_API_KEY=your-key-here \
   -p 7860:7860 \
   foamagent:foundation-v10
@@ -330,16 +369,11 @@ docker run -it \
 
 The ESI v2006 image requires the versioned `database/esi-v2006/` corpus in the build context. Its Docker build validates that all Git LFS assets are hydrated.
 
+Both images use `/home/openfoam/Foam-Agent`, the same Conda environment setup, and the same startup update policy. ESI v2006 retains a separate source-compilation stage on Ubuntu 20.04; its entrypoint handles the v2006 environment initialization before activating Conda. Both entrypoints update from `csml-rpi/Foam-Agent` by default. Set `FOAMAGENT_SKIP_UPDATE=1` to run the code bundled in the image (including local changes).
+
 ```bash
-python scripts/build_docker_image.py --openfoam-target esi-v2006
+docker build -f docker/Dockerfile.esi-v2006 -t foamagent:esi-v2006 .
 docker run -it foamagent:esi-v2006
-```
-
-After either image is built, run the target-runtime smoke test (it validates the sourced version and `blockMesh`, but does not run a solver):
-
-```bash
-bash scripts/verify_target_docker.sh foundation-v10
-bash scripts/verify_target_docker.sh esi-v2006
 ```
 
 ## Troubleshooting
