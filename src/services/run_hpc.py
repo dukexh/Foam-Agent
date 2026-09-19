@@ -188,7 +188,19 @@ def create_slurm_script_with_error_context(
 
 def submit_slurm_job(script_path: str) -> Tuple[Optional[str], bool, str]:
     try:
-        result = subprocess.run(["sbatch", script_path], capture_output=True, text=True, check=True)
+        # The script's runtime guard checks $WM_PROJECT_VERSION before any module-load
+        # step (the generated script is told not to source OpenFOAM itself), so it
+        # relies on the submitting shell's environment reaching the job. sbatch's
+        # inherited-environment default isn't guaranteed on every site (some default
+        # to --export=NONE); pass --export=ALL explicitly so Foam-Agent's own already-
+        # sourced OpenFOAM environment (required just to run this process) is what the
+        # guard sees, instead of failing closed on every explicit-target HPC run.
+        result = subprocess.run(
+            ["sbatch", "--export=ALL", script_path],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         output = result.stdout.strip()
         job_id_match = re.search(r'Submitted batch job (\d+)', output)
         if job_id_match:

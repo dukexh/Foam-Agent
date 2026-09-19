@@ -34,7 +34,6 @@ class CaseManifest:
     def supported(self) -> bool:
         return self.platform in {
             "foundation-v10",
-            "foundation-v10-compatible",
             ESI_V2006,
         }
 

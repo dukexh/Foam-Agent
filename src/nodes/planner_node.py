@@ -25,13 +25,24 @@ def planner_node(state):
                     result["mesh_type"] = "custom_mesh"
                 else:
                     mesh_choice = llm_requires_custom_mesh({**state, **result})
-                    result["mesh_type"] = (
-                        "gmsh_mesh" if mesh_choice == 2 else "standard_mesh"
-                    )
-            result["requires_hpc"] = llm_requires_hpc({**state, **result})
-            result["requires_visualization"] = llm_requires_visualization(
-                {**state, **result}
-            )
+                    if mesh_choice == 1:
+                        # No path was given; route to custom_mesh anyway so
+                        # meshing_node/copy_custom_mesh surfaces the same
+                        # "No custom mesh path provided" error the generated-case
+                        # path produces, instead of silently doing standard meshing.
+                        result["mesh_type"] = "custom_mesh"
+                    elif mesh_choice == 2:
+                        result["mesh_type"] = "gmsh_mesh"
+                    else:
+                        result["mesh_type"] = "standard_mesh"
+            # plan_imported_case's no-LLM-needed fast path already decides these;
+            # only ask the LLM when it didn't.
+            if "requires_hpc" not in result:
+                result["requires_hpc"] = llm_requires_hpc({**state, **result})
+            if "requires_visualization" not in result:
+                result["requires_visualization"] = llm_requires_visualization(
+                    {**state, **result}
+                )
         print("</planner>")
         return result
 

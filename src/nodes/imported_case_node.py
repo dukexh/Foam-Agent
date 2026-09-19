@@ -35,7 +35,7 @@ def case_import_node(state: dict[str, Any]) -> dict[str, Any]:
     if not getattr(config, "openfoam_target", ""):
         if manifest.platform == ESI_V2006:
             config.openfoam_target = ESI_V2006
-        elif manifest.platform in {FOUNDATION_V10, "foundation-v10-compatible"}:
+        elif manifest.platform == FOUNDATION_V10:
             config.openfoam_target = FOUNDATION_V10
 
     output_root = Path(manifest.output_root)
@@ -46,7 +46,7 @@ def case_import_node(state: dict[str, Any]) -> dict[str, Any]:
 
     llm_service = None
     case_stats = None
-    if manifest.platform in {FOUNDATION_V10, "foundation-v10-compatible", ESI_V2006}:
+    if manifest.platform in {FOUNDATION_V10, ESI_V2006}:
         try:
             llm_service, case_stats = load_agent_resources(config)
         except Exception as exc:

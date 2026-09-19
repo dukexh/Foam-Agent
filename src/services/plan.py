@@ -477,7 +477,7 @@ def plan_imported_case(state: dict[str, Any]) -> dict[str, Any]:
     context = dict(state.get("case_context") or {})
     issues = list(context.get("issues") or [])
     target = configured_openfoam_target(state.get("config")) or context.get("platform")
-    if target not in {"foundation-v10", "foundation-v10-compatible", "esi-v2006"}:
+    if target not in {"foundation-v10", "esi-v2006"}:
         return {
             "workflow_status": "failed",
             "requires_meshing": False,
@@ -518,6 +518,12 @@ def plan_imported_case(state: dict[str, Any]) -> dict[str, Any]:
             "workflow_status": "running",
             "requires_meshing": False,
             "requires_input_writer": False,
+            # A complete, untouched case with no explicit user requirement has
+            # nothing to infer from: keep the same conservative defaults
+            # llm_requires_hpc/llm_requires_visualization use when unsure, and
+            # skip the LLM calls entirely for this no-LLM-needed fast path.
+            "requires_hpc": False,
+            "requires_visualization": False,
             "termination_reason": None,
         }
 

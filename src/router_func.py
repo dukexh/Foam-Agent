@@ -117,10 +117,13 @@ def route_after_planner(state: GraphState):
     For current version, if user wants custom mesh, user should be able to provide a path to the mesh file.
     """
     if state.get("case_origin") == "imported":
-        if state.get("target_mismatch") and state.get("error_logs"):
-            print("<router>Case target mismatch detected. Routing to reviewer for repair.</router>")
-            return "reviewer"
         if state.get("workflow_status") == "failed":
+            if state.get("target_mismatch"):
+                # A configured-vs-detected OpenFOAM target mismatch is an environment/config
+                # error, not something the reviewer's file-rewrite loop can fix. End directly
+                # so the caller sees the actionable "case_target_mismatch" diagnostic instead of
+                # a wasted repair loop ending in "max_review_loop_reached".
+                print("<router>Case target mismatch detected. Ending workflow.</router>")
             return END
         if state.get("requires_meshing"):
             return "meshing"

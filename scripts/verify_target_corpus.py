@@ -18,6 +18,7 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 RAW_FILES = (
     "openfoam_case_stats.json",
+    "openfoam_commands.txt",
     "openfoam_command_help.txt",
     "openfoam_allrun_scripts.txt",
     "openfoam_tutorials_structure.txt",

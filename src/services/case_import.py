@@ -62,17 +62,50 @@ def _safe_zip_member(entry: zipfile.ZipInfo) -> Optional[PurePosixPath]:
     return relative
 
 
+# Bound zip-bomb exposure: a small, crafted archive can otherwise expand to an
+# arbitrary size (or entry count) inside a tmpfs-backed TemporaryDirectory before
+# any case-content validation runs.
+_MAX_ZIP_ENTRIES = 200_000
+_MAX_ZIP_UNCOMPRESSED_BYTES = 10 * 1024 ** 3  # 10 GiB: generous for mesh-heavy cases
+_ZIP_COPY_CHUNK_SIZE = 1024 * 1024
+
+
 def _extract_zip(archive: Path, destination: Path) -> None:
     try:
         with zipfile.ZipFile(archive) as zip_file:
-            for entry in zip_file.infolist():
+            infolist = zip_file.infolist()
+            if len(infolist) > _MAX_ZIP_ENTRIES:
+                raise CaseImportError(
+                    f"ZIP archive has too many entries ({len(infolist)} > {_MAX_ZIP_ENTRIES})."
+                )
+            declared_total = sum(entry.file_size for entry in infolist)
+            if declared_total > _MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise CaseImportError(
+                    f"ZIP archive's declared uncompressed size ({declared_total} bytes) "
+                    f"exceeds the {_MAX_ZIP_UNCOMPRESSED_BYTES}-byte limit."
+                )
+            written_total = 0
+            for entry in infolist:
                 relative = _safe_zip_member(entry)
                 if relative is None:
                     continue
                 target = destination.joinpath(*relative.parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with zip_file.open(entry) as source, target.open("wb") as output:
-                    shutil.copyfileobj(source, output)
+                    while True:
+                        chunk = source.read(_ZIP_COPY_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        written_total += len(chunk)
+                        # Track actual bytes written rather than trusting the entry's
+                        # declared file_size, which a crafted archive can understate.
+                        if written_total > _MAX_ZIP_UNCOMPRESSED_BYTES:
+                            raise CaseImportError(
+                                "ZIP archive exceeded the "
+                                f"{_MAX_ZIP_UNCOMPRESSED_BYTES}-byte uncompressed size limit "
+                                "during extraction."
+                            )
+                        output.write(chunk)
     except zipfile.BadZipFile as exc:
         raise CaseImportError(f"Invalid ZIP archive: {archive}") from exc
 
@@ -173,7 +206,7 @@ def _resolve_platform(
     if target:
         compatible = {"unknown", target}
         if target == FOUNDATION_V10:
-            compatible.update({"foundation-v10-compatible", "foundation-unknown-version"})
+            compatible.add("foundation-unknown-version")
         elif target == ESI_V2006:
             compatible.add("esi-unknown-version")
         if detected not in compatible:
@@ -181,7 +214,7 @@ def _resolve_platform(
                 f"Configured target {target!r} differs from detected case platform {detected!r}."
             )
         return target, issues
-    if detected in {FOUNDATION_V10, "foundation-v10-compatible", ESI_V2006}:
+    if detected in {FOUNDATION_V10, ESI_V2006}:
         return detected, issues
     issues.append(
         "The case platform could not be resolved to Foundation v10 or ESI v2006; "

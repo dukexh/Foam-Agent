@@ -631,7 +631,14 @@ def rewrite_files(
             except CasePathSafetyError as exc:
                 raise ValueError(f"Unsafe rewrite target in plan: {file_path!r}") from exc
     if not allowed_files:
-        raise ValueError("rewrite_plan.target_files must specify the files to modify.")
+        print("Warning: rewrite_plan.target_files is empty; no files to rewrite, leaving case unchanged.")
+        return {
+            "dir_structure": dir_structure,
+            "foamfiles": foamfiles,
+            "error_logs": error_logs,
+            "updated_files": [],
+            "file_diffs": [],
+        }
 
     llm_client = llm_service if llm_service is not None else global_llm_service
     response = llm_client.invoke(
