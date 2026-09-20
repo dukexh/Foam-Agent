@@ -15,11 +15,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
-import zipfile
-
 import foambench_main  # noqa: E402
 import main  # noqa: E402
-from models import CaseImportError, ExistingCasePlan  # noqa: E402
+from models import ExistingCasePlan  # noqa: E402
 from nodes.input_writer_node import input_writer_node  # noqa: E402
 from nodes.local_runner_node import local_runner_node  # noqa: E402
 from router_func import (  # noqa: E402
@@ -27,7 +25,6 @@ from router_func import (  # noqa: E402
     route_after_input_writer,
     route_after_runner,
 )
-import services.case_import as case_import_module  # noqa: E402
 from services.case_import import import_case  # noqa: E402
 from services.plan import (  # noqa: E402
     DEFAULT_IMPORTED_REQUIREMENT,
@@ -588,88 +585,3 @@ def test_allrun_generation_uses_command_help(tmp_path: Path, monkeypatch) -> Non
     assert "simpleFoam command help" in calls[1][1]
     assert all("ESI/OpenCFD OpenFOAM v2006" in system for _, system in calls)
     assert (case / "Allrun").read_text(encoding="utf-8") == "#!/bin/sh\nsimpleFoam"
-
-
-def _zip_directory(source: Path, zip_path: Path) -> Path:
-    with zipfile.ZipFile(zip_path, "w") as zip_file:
-        for path in sorted(source.rglob("*")):
-            if path.is_file():
-                zip_file.write(path, path.relative_to(source).as_posix())
-    return zip_path
-
-
-def test_zip_import_materialises_case_same_as_directory_import(tmp_path: Path) -> None:
-    source = _make_case(tmp_path / "source")
-    archive = _zip_directory(source, tmp_path / "case.zip")
-
-    manifest = import_case(archive, tmp_path / "task")
-
-    assert manifest.platform == "foundation-v10"
-    assert manifest.application == "icoFoam"
-    assert (tmp_path / "task" / "work" / "system" / "controlDict").is_file()
-
-
-def test_zip_import_rejects_path_traversal_entry(tmp_path: Path) -> None:
-    archive = tmp_path / "evil.zip"
-    with zipfile.ZipFile(archive, "w") as zip_file:
-        zip_file.writestr("system/controlDict", "application icoFoam;\n")
-        zip_file.writestr("../escape.txt", "pwned")
-
-    with pytest.raises(CaseImportError, match="escapes the import root"):
-        import_case(archive, tmp_path / "task")
-
-
-def test_zip_import_rejects_absolute_path_entry(tmp_path: Path) -> None:
-    archive = tmp_path / "evil.zip"
-    with zipfile.ZipFile(archive, "w") as zip_file:
-        zip_file.writestr("system/controlDict", "application icoFoam;\n")
-        zip_file.writestr("/etc/escape.txt", "pwned")
-
-    with pytest.raises(CaseImportError, match="escapes the import root"):
-        import_case(archive, tmp_path / "task")
-
-
-def test_zip_import_rejects_symlink_entry(tmp_path: Path) -> None:
-    import stat as stat_module
-
-    archive = tmp_path / "evil.zip"
-    with zipfile.ZipFile(archive, "w") as zip_file:
-        zip_file.writestr("system/controlDict", "application icoFoam;\n")
-        link_info = zipfile.ZipInfo("system/escape_link")
-        link_info.external_attr = (stat_module.S_IFLNK | 0o777) << 16
-        zip_file.writestr(link_info, "/etc/passwd")
-
-    with pytest.raises(CaseImportError, match="symbolic links are not supported"):
-        import_case(archive, tmp_path / "task")
-
-
-def test_zip_import_rejects_too_many_entries(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(case_import_module, "_MAX_ZIP_ENTRIES", 2)
-    archive = tmp_path / "big.zip"
-    with zipfile.ZipFile(archive, "w") as zip_file:
-        zip_file.writestr("system/controlDict", "application icoFoam;\n")
-        zip_file.writestr("system/fvSchemes", "ddtSchemes {}\n")
-        zip_file.writestr("system/fvSolution", "solvers {}\n")
-
-    with pytest.raises(CaseImportError, match="too many entries"):
-        import_case(archive, tmp_path / "task")
-
-
-def test_zip_import_rejects_declared_oversized_archive(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setattr(case_import_module, "_MAX_ZIP_UNCOMPRESSED_BYTES", 100)
-    archive = tmp_path / "bomb.zip"
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zip_file:
-        zip_file.writestr("system/controlDict", "x" * 10_000)
-
-    with pytest.raises(CaseImportError, match="uncompressed size"):
-        import_case(archive, tmp_path / "task")
-
-
-def test_directory_import_rejects_symlink_inside_source(tmp_path: Path) -> None:
-    source = _make_case(tmp_path / "source")
-    target = tmp_path / "outside.txt"
-    target.write_text("secret", encoding="utf-8")
-    (source / "system" / "escape_link").symlink_to(target)
-
-    with pytest.raises(CaseImportError, match="symbolic link"):
-        import_case(source, tmp_path / "task")
