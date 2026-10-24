@@ -228,8 +228,16 @@ class _CodexResponsesWrapper:
         for m in messages:
             role = m.get("role")
             content = m.get("content", "")
-            # Responses API supports rich content; we use simple input_text.
-            out.append({"role": role, "content": [{"type": "input_text", "text": content}]})
+            if isinstance(content, list):
+                blocks = []
+                for block in content:
+                    if block.get("type") == "image_url":
+                        blocks.append({"type": "input_image", "image_url": block["image_url"]["url"]})
+                    elif block.get("type") == "text":
+                        blocks.append({"type": "input_text", "text": block["text"]})
+                out.append({"role": role, "content": blocks})
+            else:
+                out.append({"role": role, "content": [{"type": "input_text", "text": content}]})
         return out
 
     @staticmethod
@@ -338,6 +346,9 @@ class _CodexResponsesWrapper:
             # Codex backend streams OpenAI Responses-style events.
             if isinstance(j, dict):
                 t = j.get("type")
+                if t in {"error", "response.failed"}:
+                    detail = j.get("error") or j.get("response", {}).get("error") or j
+                    raise RuntimeError(f"Model stream failed: {detail}")
                 if t == "response.output_text.delta" and isinstance(j.get("delta"), str):
                     chunks.append(j["delta"])
                     continue
@@ -345,6 +356,12 @@ class _CodexResponsesWrapper:
                     # Some clients rely on done; we already collected deltas but keep as fallback.
                     if not chunks:
                         chunks.append(j["text"])
+                    continue
+
+                if t == "response.completed" and not chunks:
+                    completed_text = self._extract_output_text(j.get("response", {}))
+                    if completed_text:
+                        chunks.append(completed_text)
                     continue
 
             # Fallback: try generic extraction.
@@ -730,7 +747,8 @@ class LLMService:
               user_prompt: str, 
               system_prompt: Optional[str] = None, 
               pydantic_obj: Optional[Type[BaseModel]] = None,
-              max_retries: int = 10) -> Any:
+              max_retries: int = 10,
+              images: Optional[list] = None) -> Any:
         """
         Invoke the LLM with the given prompts and return the response.
         
@@ -748,12 +766,31 @@ class LLMService:
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": user_prompt})
-        
+        content = user_prompt
+        if images:
+            if self.model_provider.lower() == "deepseek":
+                raise ValueError("Configure a vision-capable provider with FOAMAGENT_VISION_PROVIDER for CAD")
+            import base64
+            import mimetypes
+            content = [{"type": "text", "text": user_prompt}]
+            for image in images:
+                if str(image).startswith("data:image/"):
+                    url = str(image)
+                else:
+                    path = Path(image)
+                    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+                    url = "data:" + mime + ";base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+                content.append({"type": "image_url", "image_url": {"url": url}})
+        messages.append({"role": "user", "content": content})
+
+        # Text accounting remains approximate; image usage is not treated as text tokens.
         # Calculate prompt tokens
         prompt_tokens = 0
         for message in messages:
-            prompt_tokens += self.llm.get_num_tokens(message["content"])
+            message_content = message["content"]
+            if isinstance(message_content, list):
+                message_content = "\n".join(block.get("text", "") for block in message_content)
+            prompt_tokens += self.llm.get_num_tokens(message_content)
         
         retry_count = 0
         transport_retry_count = 0
@@ -876,6 +913,8 @@ def load_agent_resources(config: Any) -> tuple[Any, Any]:
 
 
 class GraphState(TypedDict):
+    geometry_path: Optional[str]
+    cad_state: Optional[dict]
     user_requirement: str
     config: Config
     case_dir: str

@@ -4,6 +4,9 @@ from services import meshing
 
 
 def meshing_node(state):
+    if state.get("geometry_path"):
+        from services.cad.workflow import execute_cad
+        return execute_cad(state)
     mesh_type = state.get("mesh_type", "standard_mesh")
     if mesh_type == "gmsh_mesh":
         backend = meshing.gmsh_meshing

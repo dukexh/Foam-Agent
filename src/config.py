@@ -39,6 +39,14 @@ class Config:
     # - Bedrock: application inference profile ARN
     # - Anthropic: claude-3-5-sonnet-latest
     model_version: str = "gpt-5.3-codex"
+    # CAD is opt-in; Ansys dependencies are loaded only by the Windows worker.
+    windows_python: str = os.getenv("FOAMAGENT_WINDOWS_PYTHON", "")
+    ansys_root: str = os.getenv("FOAMAGENT_ANSYS_ROOT", "")
+    windows_runtime_root: str = os.getenv("FOAMAGENT_CAD_RUNTIME", "C:/Users/Public/FoamAgentCAD")
+    spaceclaim_timeout_s: float = 900
+    cad_ui_mode: str = "gui"
+    vision_model: str = os.getenv("FOAMAGENT_VISION_MODEL", "")
+    vision_model_provider: str = os.getenv("FOAMAGENT_VISION_PROVIDER", "")
     temperature: float = 1
     openfoam_fork: str = "foundation"  # Default to Foundation v10
     # An explicit target is additive.  Leaving it empty keeps the existing

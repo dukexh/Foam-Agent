@@ -431,3 +431,9 @@ If you use Foam-Agent in your research, please cite our paper:
 }
 
 ```
+
+## SpaceClaim CAD preparation
+
+Prepare fluid geometry and named boundaries from a SpaceClaim .scdoc file in WSL, using Windows SpaceClaim 2024 R1.
+Explicit confirmation, save-and-exit, clarification and CAD checkpoint recovery are supported.
+This CAD-only stage stops before mesh generation and solver planning. See [setup and usage](docs/spaceclaim-cad.md).

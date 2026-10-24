@@ -14,6 +14,9 @@ from .plan import resolve_case_dir
 
 def prepare_inputs(state):
     config = state["config"]
+    if state.get("geometry_path"):
+        from .cad.workflow import prepare_cad
+        return prepare_cad(state)
     try:
         if state.get("workflow_mode") == "imported_case":
             # Keep the existing adapter's target detection and failure semantics.

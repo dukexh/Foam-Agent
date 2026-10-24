@@ -56,7 +56,12 @@ def parse_args():
         action='store_true',
         help="Explicitly allow replacing an existing non-empty output directory."
     )
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent / "src"))
+    from services.cad.arguments import add_cad_arguments, validate_cad_arguments
+    add_cad_arguments(parser)
     args = parser.parse_args()
+    validate_cad_arguments(parser, args)
     if args.case_subdir and not args.case_path:
         parser.error("--case_subdir requires --case_path.")
     return args
@@ -87,7 +92,10 @@ def run_command(command):
         )
         print(f"Finished command: Return Code {result.returncode}")
     except subprocess.CalledProcessError as e:
-        print(f"Error running command: {e}")
+        if e.returncode == 3:
+            print("Workflow paused; use --resume with the saved task directory.")
+        else:
+            print(f"Error running command: {e}")
         sys.exit(e.returncode)
 
 def main():
@@ -102,7 +110,12 @@ def main():
     main_cmd = [sys.executable, "src/main.py", "--output_dir", args.output]
     if args.openfoam_target:
         main_cmd.extend(["--openfoam_target", args.openfoam_target])
-    if args.case_path:
+    if args.resume:
+        main_cmd.extend(["--resume", args.resume])
+    elif args.geometry_path:
+        main_cmd.extend(["--geometry_path", args.geometry_path, "--stop-after", args.stop_after,
+                         "--ui-mode", args.ui_mode, "--prompt_path", args.prompt_path])
+    elif args.case_path:
         main_cmd.extend(["--case_path", args.case_path])
         if args.prompt_path:
             main_cmd.extend(["--prompt_path", args.prompt_path])

@@ -32,6 +32,8 @@ from services.plan import DEFAULT_IMPORTED_REQUIREMENT
 def workflow_exit_code(state: GraphState) -> int:
     """Return a non-zero process status for any terminal workflow failure."""
     status = state.get("workflow_status")
+    if status == "paused":
+        return 3
     return 2 if status in {"failed", "partial_success"} or state.get("termination_reason") else 0
 
 
@@ -76,12 +78,15 @@ def initialize_state(
     case_import_subdir: Optional[str] = None,
     requires_visualization: Optional[bool] = None,
     user_requirement_explicit: bool = True,
+    geometry_path: Optional[str] = None,
 ) -> GraphState:
     """Build state for generated or imported agent workflows."""
     case_stats = None
     llm_service = None
     state = GraphState(
         user_requirement=user_requirement,
+        geometry_path=geometry_path,
+        cad_state=None,
         config=config,
         case_dir="",
         case_name="",
@@ -145,8 +150,19 @@ def main(
     *,
     case_path: Optional[str] = None,
     case_subdir: Optional[str] = None,
+    geometry_path: Optional[str] = None,
+    stop_after: Optional[str] = None,
 ) -> GraphState:
     """Run the shared workflow for a prompt or an existing case."""
+    if geometry_path:
+        if case_path or custom_mesh_path:
+            raise ValueError("CAD input cannot be combined with case or external mesh input")
+        if stop_after != "cad":
+            raise ValueError("CAD preparation requires --stop-after cad in this release")
+        if not config.case_dir or not user_requirement.strip():
+            raise ValueError("CAD preparation requires an output directory and non-empty requirement")
+    elif stop_after:
+        raise ValueError("--stop-after cad requires --geometry_path")
     if case_path and not config.case_dir:
         raise ValueError("--output_dir is required when --case_path is used.")
     try:
@@ -159,6 +175,7 @@ def main(
             (user_requirement.strip() or DEFAULT_IMPORTED_REQUIREMENT) if case_path else user_requirement,
             config,
             custom_mesh_path,
+            geometry_path=geometry_path,
             workflow_mode="imported_case" if case_path else "prompt",
             case_import_path=case_path,
             case_import_subdir=case_subdir,
@@ -170,6 +187,9 @@ def main(
         # Invoke the graph
         result = app.invoke(initial_state, config={"recursion_limit": config.recursion_limit})
 
+        if geometry_path:
+            print_cad_outcome(result)
+            return result
         termination_reason = result.get("termination_reason")
         if result.get("workflow_status") == "partial_success":
             print("<workflow_end>Simulation completed successfully, but visualization failed.</workflow_end>")
@@ -192,6 +212,20 @@ def main(
         raise
     finally:
         close_logging()
+
+
+def print_cad_outcome(state):
+    status = state.get("workflow_status")
+    cad = state.get("cad_state") or {}
+    if status == "cad_ready":
+        print("CAD preparation complete: " + cad["result"]["confirmed_geometry"])
+    elif status == "paused":
+        print("CAD paused: " + cad.get("question", ""))
+        print("Resume with --resume " + cad.get("run_dir", ""))
+    elif status == "cancelled":
+        print("CAD task cancelled; existing artifacts were retained.")
+    else:
+        print("CAD preparation failed: " + cad.get("error", ""))
 
 
 if __name__ == "__main__":
@@ -260,7 +294,10 @@ if __name__ == "__main__":
         help="Explicitly allow replacing an existing non-empty output directory.",
     )
     
+    from services.cad.arguments import add_cad_arguments, validate_cad_arguments
+    add_cad_arguments(parser)
     args = parser.parse_args()
+    validate_cad_arguments(parser, args)
     print(f"args: {args}")
     
     # Initialize configuration.
@@ -282,6 +319,13 @@ if __name__ == "__main__":
         config.reuse_generated_dir = args.reuse_generated_dir
     
     config.overwrite_case_dir = args.overwrite_output
+    config.cad_ui_mode = args.ui_mode
+    if args.resume:
+        from services.cad.workflow import resume_cad
+        from services.cad.cli import interactive
+        final_state = interactive(resume_cad(config, args.resume), config)
+        print_cad_outcome(final_state)
+        raise SystemExit(workflow_exit_code(final_state))
 
     if args.case_path:
         if args.reuse_generated_dir:
@@ -306,6 +350,12 @@ if __name__ == "__main__":
         args.custom_mesh_path,
         case_path=args.case_path,
         case_subdir=args.case_subdir,
+        geometry_path=args.geometry_path,
+        stop_after=args.stop_after,
     )
+    if args.geometry_path:
+        from services.cad.cli import interactive
+        final_state = interactive(final_state, config)
+        print_cad_outcome(final_state)
     if exit_code := workflow_exit_code(final_state):
         raise SystemExit(exit_code)

@@ -58,7 +58,7 @@ from the requirement and available files. No uploaded path or polyMesh directory
 forces a backend or reuse policy. Standard OpenFOAM utilities, generated Gmsh,
 uploaded Gmsh .msh files and meshes inside imported cases use the same graph.
 External .geo scripts and standalone polyMesh directories are outside this update;
-SpaceClaim/Fluent input is deferred. Planners use prepared input paths, case file
+Fluent meshing is deferred; SpaceClaim CAD-only preparation is described below. Planners use prepared input paths, case file
 listings and contents; mesh handoff includes actual patches and boundary text.
 
 Meshing generates/edits mesh inputs, executes Allmesh or converter tools and
@@ -192,3 +192,14 @@ Use `esi-v2006` with a matching runtime to build that corpus. Runtime defaults a
 - **`GraphState`** defines the state schema. LangGraph merges node-returned updates; some nodes also mutate nested objects such as `Config`. Do not assume every node shares one unchanged dictionary instance.
 - **Visualization failure after simulation success** produces `partial_success`, `termination_reason=visualization_failed`, and the English message `Simulation completed successfully, but visualization failed.` The CLI exits nonzero; MCP `run_case` includes the summary and visualization error. A standalone MCP `visualization` failure raises an error.
 - **HPC monitoring is basic**: it runs Slurm commands in the agent's environment, treats an empty `squeue` result as completed, and does not query `sacct` or validate the final exit code. Monitoring timeout returns the last observed state and may enter the existing repair/resubmission loop. It is not an SSH deployment or job-resume service.
+
+## SpaceClaim CAD preparation (PR 1)
+
+CAD input enters Preparation, Meshing Planner and the SpaceClaim backend inside the ordinary
+Meshing node. WSL owns planning, models, durable CAD state and confirmation; Windows runs native
+SpaceClaim 2024 R1 operations only. Source and worker scripts live in this repository.
+The CAD-only route must stop before Solver Planner, never claim a mesh or simulation success,
+and must not load OpenFOAM corpus resources or Fluent. Explicit confirmation is mandatory.
+Keep multi-body retention/explicit merge groups, actual saved-CAD validation, clarification,
+save-and-exit, cancellation and explicit retry. Operation semantic reviews and automatic repair
+belong to the subsequent PR. Preserve existing inputs and local user changes.

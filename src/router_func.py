@@ -71,6 +71,8 @@ def route_after_solver_planner(state: GraphState):
 
 def route_after_meshing(state: GraphState):
     """Plan the solver after initial meshing; preserve pending repairs on retries."""
+    if state.get("geometry_path"):
+        return END
     if state.get("termination_reason"):
         return END
     if state.get("error_logs"):
